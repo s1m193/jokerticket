@@ -1,0 +1,14 @@
+# AD Pentest Framework - Requirements
+impacket
+ldap3
+colorama
+pyasn1
+cryptography
+asn1crypto
+oscrypto
+dsinternals
+minikerberos
+pycryptodome
+certipy-ad
+pypsrp
+gssapi
