@@ -1,7 +1,7 @@
 ## 🃏 JokerTicket – AD Pentesting Framework
 
 <p align="center">
-  <img src="JokerTicket.jpg" width="160"/>
+  <img src="JokerTicket.jpg" width="360"/>
 </p>
 
 
