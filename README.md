@@ -1,6 +1,9 @@
-# 🃏 JokerTicket – AD Pentesting Framework
+## 🃏 JokerTicket – AD Pentesting Framework
 
-![JokerTicket Logo](JokerTicket.jpg)
+<p align="center">
+  <img src="JokerTicket.jpg" width="160"/>
+</p>
+
 
 ## 📌 Overview
 
