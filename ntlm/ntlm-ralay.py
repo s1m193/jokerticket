@@ -1,9 +1,4 @@
 #!/usr/bin/env python3
-"""
-Joker Ticket - NTLM Coercion & Relay Attack Tool
-Pure Impacket API Integration - No External Dependencies
-Production Ready v5.0 - Integrated Original Tools Logic
-"""
 import os
 import sys
 import re
