@@ -1,21 +1,5 @@
 #!/usr/bin/env python3
-"""
-================================================================================
-getTGT Pass-the-Key Standalone
-Fully self-contained Kerberos Pass-the-Key tool. No external script calls.
-Uses only Python standard library + impacket.
 
-Features:
-  - Request TGT via AES256 or AES128 key (Pass-the-Key)
-  - Save ticket as ccache
-  - Built-in ticket inspection (like klist)
-  - Built-in ccache -> kirbi converter
-  - Interactive SMB shell via Kerberos ticket
-  - Comprehensive error handling on all operations
-
-Usage: python3 getTGT_ptk.py
-================================================================================
-"""
 
 import sys
 import os
@@ -27,6 +11,27 @@ import time
 import struct
 from binascii import unhexlify, hexlify, Error as BinasciiError
 from datetime import datetime, timezone
+import signal
+import threading
+
+_interrupt_event = threading.Event()
+
+def _signal_handler(signum, frame):
+    _interrupt_event.set()
+    raise KeyboardInterrupt
+
+signal.signal(signal.SIGINT, _signal_handler)
+
+class C:
+    H  = '[95m'
+    B  = '[94m'
+    G  = '[92m'
+    Y  = '[93m'
+    R  = '[91m'
+    X  = '[0m'
+    BD = '[1m'
+    DIM = '[2m'
+
 
 # ── Suppress impacket noise ──
 logging.disable(logging.CRITICAL)
@@ -49,12 +54,11 @@ except ImportError as e:
     sys.exit(1)
 
 # ── CONSTANTS ──
-PROGRAM_BANNER = r"""
-  __ _ ___ _ |_  _ |  _|   __ __ _ _  _
- / _` / _ \ ' \ || | | |   / _/ _` | || |
- \__, \___/_||_\_, | |_|   \__\__,_|\_, |
- |___/        |__/                 |__/
- Pass-the-Key Standalone | No external deps
+PROGRAM_BANNER = f"""
+{C.BD}{C.B}╔══════════════════════════════════════════════════════════════════════════════╗{C.X}
+{C.BD}{C.B}║                             PASS-THE-KEY                                     ║{C.X}
+{C.BD}{C.B}║                     takes the key to open the shell                          ║{C.X}
+{C.BD}{C.B}╚══════════════════════════════════════════════════════════════════════════════╝{C.X}
 """
 
 TMP_DIR = r"C:\Windows\Temp"
@@ -175,9 +179,11 @@ def validate_target(value):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def choose_auth_method():
-    print("\n" + "=" * 60)
-    print(" CHOOSE AES KEY TYPE (Pass-the-Key)")
-    print("=" * 60)
+    inner = 78
+    pad = lambda text: "║  " + text + " " * (inner - len(text) - 4) + "║"
+    print(f"{C.BD}{C.B}╔{"═" * inner}╗{C.X}")
+    print(f"{C.BD}{C.B}{pad("CHOOSE AES KEY TYPE (Pass-the-Key)")}{C.X}")
+    print(f"{C.BD}{C.B}╚{"═" * inner}╝{C.X}")
     print(" [1] AES256 key (64 hex chars)")
     print(" [2] AES128 key (32 hex chars)")
     print("=" * 60)
@@ -251,9 +257,11 @@ def inspect_ticket(ccache_path):
         return
     try:
         ccache = CCache.loadFile(ccache_path)
-        print("\n" + "=" * 60)
-        print(" TICKET CACHE INSPECTOR (built-in)")
-        print("=" * 60)
+        inner = 78
+        pad = lambda text: "║  " + text + " " * (inner - len(text) - 4) + "║"
+        print(f"{C.BD}{C.B}╔{"═" * inner}╗{C.X}")
+        print(f"{C.BD}{C.B}{pad("TICKET CACHE INSPECTOR (built-in)")}{C.X}")
+        print(f"{C.BD}{C.B}╚{"═" * inner}╝{C.X}")
         print(f" Default principal: {ccache.principal.toPrincipal()}")
         print(f" Credentials count: {len(ccache.credentials)}")
         print("-" * 60)
@@ -425,9 +433,11 @@ def handle_kerberos_error(e, domain, username, dc_ip):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def collect_credentials():
-    print("\n" + "=" * 60)
-    print(" TARGET INFORMATION")
-    print("=" * 60)
+    inner = 78
+    pad = lambda text: "║  " + text + " " * (inner - len(text) - 4) + "║"
+    print(f"{C.BD}{C.B}╔{"═" * inner}╗{C.X}")
+    print(f"{C.BD}{C.B}{pad("TARGET INFORMATION")}{C.X}")
+    print(f"{C.BD}{C.B}╚{"═" * inner}╝{C.X}")
     domain = get_input(
         " Domain (e.g., CORP.LOCAL, cs.org)",
         required=True, validator=validate_domain
@@ -442,9 +452,11 @@ def collect_credentials():
         required=True, validator=validate_ip
     )
 
-    print("\n" + "=" * 60)
-    print(" CREDENTIALS (Pass-the-Key)")
-    print("=" * 60)
+    inner = 78
+    pad = lambda text: "║  " + text + " " * (inner - len(text) - 4) + "║"
+    print(f"{C.BD}{C.B}╔{"═" * inner}╗{C.X}")
+    print(f"{C.BD}{C.B}{pad("CREDENTIALS (Pass-the-Key)")}{C.X}")
+    print(f"{C.BD}{C.B}╚{"═" * inner}╝{C.X}")
     auth_choice = choose_auth_method()
     aeskey = ""
     key_type = ""
@@ -520,9 +532,11 @@ def print_next_steps(username, domain, dc_ip):
     ccache_file = f"{username}.ccache"
     kirbi_file = f"{username}.kirbi"
 
-    print("\n" + "=" * 60)
-    print(" NEXT STEPS")
-    print("=" * 60)
+    inner = 78
+    pad = lambda text: "║  " + text + " " * (inner - len(text) - 4) + "║"
+    print(f"{C.BD}{C.B}╔{"═" * inner}╗{C.X}")
+    print(f"{C.BD}{C.B}{pad("NEXT STEPS")}{C.X}")
+    print(f"{C.BD}{C.B}╚{"═" * inner}╝{C.X}")
     print(" Built-in (no external scripts needed):")
     print(f"    Inspect ticket:  run the built-in inspector from main menu")
     print(f"    Convert to kirbi: run the built-in converter from main menu")
@@ -889,9 +903,11 @@ def list_shares(smb):
 
 def interactive_ticket_shell(shell):
     """Interactive command shell using the ticket."""
-    print("\n" + "=" * 60)
-    print(" TICKET SHELL - Authenticated via Kerberos Pass-the-Key")
-    print("=" * 60)
+    inner = 78
+    pad = lambda text: "║  " + text + " " * (inner - len(text) - 4) + "║"
+    print(f"{C.BD}{C.B}╔{"═" * inner}╗{C.X}")
+    print(f"{C.BD}{C.B}{pad("TICKET SHELL - Authenticated via Kerberos Pass-the-Key")}{C.X}")
+    print(f"{C.BD}{C.B}╚{"═" * inner}╝{C.X}")
     print(" Built-in commands:")
     print("   whoami  - verify identity on target")
     print("   shares  - list SMB shares")
@@ -990,9 +1006,11 @@ def sign_in_with_ticket(target, username, domain, dc_ip, ccache_file):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def print_main_menu():
-    print("\n" + "=" * 60)
-    print(" MAIN MENU")
-    print("=" * 60)
+    inner = 78
+    pad = lambda text: "║  " + text + " " * (inner - len(text) - 4) + "║"
+    print(f"{C.BD}{C.B}╔{'═' * inner}╗{C.X}")
+    print(f"{C.BD}{C.B}{pad('MAIN MENU')}{C.X}")
+    print(f"{C.BD}{C.B}╚{'═' * inner}╝{C.X}")
     print(" [1] Get TGT only (request ticket using AES key)")
     print(" [2] Get TGT + Sign in (request ticket, then SMB shell)")
     print(" [3] Sign in with existing ticket (skip TGT request)")
@@ -1018,9 +1036,11 @@ def main():
             sys.exit(0)
 
         if mode == "5":
-            print("\n" + "=" * 60)
-            print(" CONVERT CCACHE TO KIRBI")
-            print("=" * 60)
+            inner = 78
+            pad = lambda text: "║  " + text + " " * (inner - len(text) - 4) + "║"
+            print(f"{C.BD}{C.B}╔{"═" * inner}╗{C.X}")
+            print(f"{C.BD}{C.B}{pad("CONVERT CCACHE TO KIRBI")}{C.X}")
+            print(f"{C.BD}{C.B}╚{"═" * inner}╝{C.X}")
             ccache_in = get_input(" Input .ccache file", default="Administrator.ccache", required=True, validator=validate_file_exists)
             username = get_input(" Username (for output filename)", default="Administrator", required=True)
             kirbi_out = f"{username}.kirbi"
@@ -1028,17 +1048,21 @@ def main():
             continue
 
         if mode == "4":
-            print("\n" + "=" * 60)
-            print(" INSPECT TICKET")
-            print("=" * 60)
+            inner = 78
+            pad = lambda text: "║  " + text + " " * (inner - len(text) - 4) + "║"
+            print(f"{C.BD}{C.B}╔{"═" * inner}╗{C.X}")
+            print(f"{C.BD}{C.B}{pad("INSPECT TICKET")}{C.X}")
+            print(f"{C.BD}{C.B}╚{"═" * inner}╝{C.X}")
             ccache_file = get_input(" Path to .ccache file", default="Administrator.ccache", required=True, validator=validate_file_exists)
             inspect_ticket(ccache_file)
             continue
 
         if mode == "3":
-            print("\n" + "=" * 60)
-            print(" SIGN IN WITH EXISTING TICKET")
-            print("=" * 60)
+            inner = 78
+            pad = lambda text: "║  " + text + " " * (inner - len(text) - 4) + "║"
+            print(f"{C.BD}{C.B}╔{"═" * inner}╗{C.X}")
+            print(f"{C.BD}{C.B}{pad("SIGN IN WITH EXISTING TICKET")}{C.X}")
+            print(f"{C.BD}{C.B}╚{"═" * inner}╝{C.X}")
             ccache_file = get_input(" Path to .ccache file", default="Administrator.ccache", required=True, validator=validate_file_exists)
             username = get_input(" Username", required=True, validator=validate_username)
             domain = get_input(" Domain", required=True, validator=validate_domain)
@@ -1050,9 +1074,11 @@ def main():
         if mode in ("1", "2"):
             creds = collect_credentials()
 
-            print("\n" + "=" * 60)
-            print(" SUMMARY")
-            print("=" * 60)
+            inner = 78
+            pad = lambda text: "║  " + text + " " * (inner - len(text) - 4) + "║"
+            print(f"{C.BD}{C.B}╔{"═" * inner}╗{C.X}")
+            print(f"{C.BD}{C.B}{pad("SUMMARY")}{C.X}")
+            print(f"{C.BD}{C.B}╚{"═" * inner}╝{C.X}")
             print(f" Domain   : {creds['domain']}")
             print(f" Username : {creds['username']}")
             print(f" DC IP    : {creds['dc_ip']}")
@@ -1080,9 +1106,11 @@ def main():
                 continue
 
             # Mode 2: Get TGT + Sign in
-            print("\n" + "=" * 60)
-            print(" SIGN IN WITH TICKET")
-            print("=" * 60)
+            inner = 78
+            pad = lambda text: "║  " + text + " " * (inner - len(text) - 4) + "║"
+            print(f"{C.BD}{C.B}╔{"═" * inner}╗{C.X}")
+            print(f"{C.BD}{C.B}{pad("SIGN IN WITH TICKET")}{C.X}")
+            print(f"{C.BD}{C.B}╚{"═" * inner}╝{C.X}")
             target = get_input(" Target IP/Hostname", required=True, validator=validate_target)
             ccache_file = f"{creds['username']}.ccache"
             sign_in_with_ticket(target, creds["username"], creds["domain"], creds["dc_ip"], ccache_file)
