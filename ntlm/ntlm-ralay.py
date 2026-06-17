@@ -973,8 +973,7 @@ def get_impacket_version():
 def banner():
     print(Fore.CYAN + """
     ╔═══════════════════════════════════════════════════════════════════════╗
-    ║                    Joker Ticket - NTLM Attack Suite                   ║
-    ║                      Pure Impacket API Integration                    ║
+    ║                            NTLM Attack Suite                          ║
     ║                                                                       ║
     ║  [1] Relay Server (Direct NTLMRelayX API)                             ║
     ║  [2] PetitPotam Coercion (Multi-pipe, Multi-method)                   ║
