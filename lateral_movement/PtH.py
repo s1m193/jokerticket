@@ -803,7 +803,7 @@ def interactive_shell(shell: RemoteShell):
 def main():
     cprint("╔══════════════════════════════════════════════════════╗", "CYAN", bold=True)
     cprint("║           Pass-the-Hash Shell + Bind Shell           ║", "CYAN", bold=True)
-    cprint("║                                                      ║", "CYAN", bold=True)
+    cprint("║              send the hash to get shell              ║", "CYAN", bold=True)
     cprint("╚══════════════════════════════════════════════════════╝\n", "CYAN", bold=True)
 
     if input("Continue? [y/N] ").strip().lower() not in ("y", "yes"):
