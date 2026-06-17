@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""
-BloodHound Full Data Collector + ACE Diagnostic
-================================================
-Run once → collects everything → diagnoses ACE gaps → auto-corrects output.
-"""
+
 import os, sys, re, json, socket, struct, platform, signal, threading
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
