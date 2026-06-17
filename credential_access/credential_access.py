@@ -1,14 +1,5 @@
 #!/usr/bin/env python3
-"""
-Credential Access - Service Password Reader
-AD Pentesting Framework - Educational Use Only
-Exploits: ReadLAPSPassword, SyncLAPSPassword, ReadGMSAPassword, DumpSMSAPassword
-Pure Python — No external tools required
 
-IMPORTANT:
-  - LAPS v1/v2  : works over LDAP  (port 389)
-  - gMSA / sMSA : requires LDAPS   (port 636) — Windows blocks msDS-ManagedPassword over plain LDAP
-"""
 
 import socket
 import ssl
@@ -114,7 +105,6 @@ BANNER = r"""
       ====================================================
       Attacks : LAPS v1 | LAPS v2 | gMSA | sMSA
       Protocol: LDAP (389) for LAPS  |  LDAPS (636) for gMSA/sMSA
-      [!] For authorized penetration testing only.
 """
 
 # ─────────────────────────────────────────────
