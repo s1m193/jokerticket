@@ -81,9 +81,8 @@ def banner() -> None:
     print(f"""
 {C.CYAN}{C.BOLD}
 ╔══════════════════════════════════════════════════════════╗
-║                                                          ║
-║       COERCE AUTHENTICATION ATTACK TOOL  v5              ║
-║                                                          ║
+║                COERCE AUTHENTICATION                     ║
+║           make the target authenticate to you            ║
 ╚══════════════════════════════════════════════════════════╝
 {C.RESET}
 {C.YELLOW}  
