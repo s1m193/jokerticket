@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ESC4 Attack - Standalone Implementation (Fixed v8)
+ESC4 Attack 
 """
 
 import sys
