@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""
-Targeted Kerberoasting - Auto-Find + Manual Pick
-Auto-finds WriteSPN targets, YOU choose which to roast
-Authorized lab / CTF use only
-"""
+
 
 from __future__ import division
 from __future__ import print_function
@@ -28,6 +24,26 @@ from impacket.krb5.kerberosv5 import getKerberosTGT, getKerberosTGS
 from impacket.krb5.types import Principal
 from impacket.ntlm import compute_lmhash, compute_nthash
 
+import threading
+
+_interrupt_event = threading.Event()
+
+def _signal_handler(signum, frame):
+    _interrupt_event.set()
+    raise KeyboardInterrupt
+
+signal.signal(signal.SIGINT, _signal_handler)
+
+class C:
+    H  = '[95m'
+    B  = '[94m'
+    G  = '[92m'
+    Y  = '[93m'
+    R  = '[91m'
+    X  = '[0m'
+    BD = '[1m'
+    DIM = '[2m'
+
 FAKE_SPN = "fake/kerberoast.ctf.local"
 TEST_SPN = "test/scan.temp"
 
@@ -45,9 +61,11 @@ if hasattr(signal, "SIGBREAK"):
 # ── HELPERS ──────────────────────────────────────────────────
 
 def banner(msg):
-    print("\n" + "─" * 60)
-    print(f"  {msg}")
-    print("─" * 60)
+    inner = 78
+    pad = lambda text: "║  " + text + " " * (inner - len(text) - 4) + "║"
+    print(f"{C.BD}{C.B}╔{'═' * inner}╗{C.X}")
+    print(f"{C.BD}{C.B}{pad(msg)}{C.X}")
+    print(f"{C.BD}{C.B}╚{'═' * inner}╝{C.X}")
 
 def ok(msg):   print(f"  [+] {msg}")
 def info(msg): print(f"  [*] {msg}")
@@ -531,13 +549,11 @@ def cleanup_spn(conn, target):
 # ── MAIN ─────────────────────────────────────────────────────
 
 def main():
-    print("""
-╔══════════════════════════════════════════════════════════════╗
-║        TARGETED KERBEROASTING — AUTO-FIND + MANUAL PICK    ║
-║   Auto-finds WriteSPN targets, YOU choose which to roast    ║
-║   Authorized lab / CTF use only                             ║
-╚══════════════════════════════════════════════════════════════╝
-""")
+    print(f"{C.BD}{C.B}╔══════════════════════════════════════════════════════════════════════════════╗{C.X}")
+    print(f"{C.BD}{C.B}║  TARGETED KERBEROASTING — AUTO-FIND + MANUAL PICK                            ║{C.X}")
+    print(f"{C.BD}{C.B}║  Auto-finds WriteSPN targets, YOU choose which to roast                      ║{C.X}")
+    print(f"{C.BD}{C.B}║                                                                              ║{C.X}")
+    print(f"{C.BD}{C.B}╚══════════════════════════════════════════════════════════════════════════════╝{C.X}")
 
     banner("Configuration")
 
