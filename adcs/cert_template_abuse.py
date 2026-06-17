@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
-"""
-ESC4 Attack 
-"""
+
 
 import sys
 import os
@@ -65,6 +63,21 @@ except ImportError:
     NTLM_AUTH_AVAILABLE = False
 
 #
+# ─── Signal handling for graceful Ctrl+C capture ──────────────────────────────
+import signal
+import threading
+
+_interrupt_event = threading.Event()
+
+def _signal_handler(signum, frame):
+    """Capture SIGINT (Ctrl+C) and set the interrupt event."""
+    _interrupt_event.set()
+    # Re-raise KeyboardInterrupt so existing except blocks still catch it
+    raise KeyboardInterrupt
+
+# Register the handler for SIGINT (Ctrl+C)
+signal.signal(signal.SIGINT, _signal_handler)
+
 # =============================================================================
 # Color Output
 # =============================================================================
@@ -1465,47 +1478,13 @@ class ESC4Attack:
 
     # ── Main flow ─────────────────────────────────────────────────────────────
     def run(self):
-        print_banner(
-            "    \u2588\u2588\u2588\u2588\u2588\u2588\u2557\u2588\u2588\u2588"
-            "\u2588\u2588\u2588\u2557 \u2588\u2588\u2588\u2588\u2588\u2588\u2557"
-            "\u2588\u2588\u2557  \u2588\u2588\u2557    \u2588\u2588\u2588\u2588"
-            "\u2588\u2557 \u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2557\u2588"
-            "\u2588\u2588\u2588\u2588\u2588\u2588\u2557 \u2588\u2588\u2588\u2588"
-            "\u2588\u2557  \u2588\u2588\u2588\u2588\u2588\u2588\u2557\u2588\u2588"
-            "\u2557  \u2588\u2588\u2557\n"
-            "    \u2588\u2588\u2554\u2550\u2550\u2550\u2550\u255d\u2588\u2588"
-            "\u2554\u2550\u2550\u2550\u2550\u255d\u2588\u2588\u2554\u2550\u2550"
-            "\u2550\u2550\u255d\u2588\u2588\u2551  \u2588\u2588\u2551   \u2588"
-            "\u2588\u2554\u2550\u2550\u2588\u2588\u2557\u255a\u2550\u2550\u2588"
-            "\u2588\u2554\u2550\u2550\u255d\u255a\u2550\u2550\u2588\u2588\u2554"
-            "\u2550\u2550\u255d\u2588\u2588\u2554\u2550\u2550\u2588\u2588\u2557"
-            "\u2588\u2588\u2554\u2550\u2550\u2550\u255d\u2588\u2588\u2551 \u2588"
-            "\u2588\u2554\u255d\n"
-            "    \u2588\u2588\u2588\u2588\u2588\u2557  \u2588\u2588\u2588\u2588"
-            "\u2588\u2557  \u2588\u2588\u2551     \u2588\u2588\u2588\u2588\u2588"
-            "\u2588\u2588\u2551   \u2588\u2588\u2551   \u2588\u2588\u2588\u2588"
-            "\u2588\u2588\u2588\u2551   \u2588\u2588\u2551   \u2588\u2588\u2588"
-            "\u2588\u2588\u2588\u2588\u2551\u2588\u2588\u2551     \u2588\u2588"
-            "\u2588\u2588\u2588\u2554\u255d\n"
-            "    \u2588\u2588\u2554\u2550\u2550\u255d  \u255a\u2550\u2550\u2550"
-            "\u2588\u2588\u2557\u2588\u2588\u2551     \u2588\u2588\u2554\u2550"
-            "\u2550\u2588\u2588\u2551   \u2588\u2588\u2551   \u2588\u2588\u2554"
-            "\u2550\u2550\u2588\u2588\u2551   \u2588\u2588\u2551   \u2588\u2588"
-            "\u2554\u2550\u2550\u2588\u2588\u2551\u2588\u2588\u2551     \u2588"
-            "\u2588\u2554\u2550\u2588\u2588\u2557\n"
-            "    \u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2557\u2588\u2588"
-            "\u2588\u2588\u2588\u2588\u2588\u2551\u255a\u2588\u2588\u2588\u2588"
-            "\u2588\u2588\u2557\u2588\u2588\u2551  \u2588\u2588\u2551   \u2588"
-            "\u2588\u2551  \u2588\u2588\u2551   \u2588\u2588\u2551   \u2588\u2588"
-            "\u2551  \u2588\u2588\u2551\u255a\u2588\u2588\u2588\u2588\u2588\u2588"
-            "\u2557\u2588\u2588\u2551  \u2588\u2588\u2557\n"
-            "    \u255a\u2550\u2550\u2550\u2550\u2550\u2550\u255d\u255a\u2550"
-            "\u2550\u2550\u2550\u2550\u2550\u255d \u255a\u2550\u2550\u2550\u2550"
-            "\u2550\u255d\u255a\u2550\u255d  \u255a\u2550\u255d   \u255a\u2550"
-            "\u255d  \u255a\u2550\u255d   \u255a\u2550\u255d   \u255a\u2550\u255d"
-            "  \u255a\u2550\u255d \u255a\u2550\u2550\u2550\u2550\u2550\u255d\u255a"
-            "\u2550\u255d  \u255a\u2550\u255d"
-        )
+        # ─── Banner ──────────────────────────────────────────────────────────────
+        print(f"{Colors.BOLD}{Colors.OKCYAN}╔══════════════════════════════════════════════════════════════════════════════╗{Colors.ENDC}")
+        print(f"{Colors.BOLD}{Colors.OKCYAN}║  ESC4 CERTIFICATE TEMPLATE ABUSE                                             ║{Colors.ENDC}")
+        print(f"{Colors.BOLD}{Colors.OKCYAN}║  Active Directory Privilege Escalation via Certificate Templates             ║{Colors.ENDC}")
+        print(f"{Colors.BOLD}{Colors.OKCYAN}║                                                                              ║{Colors.ENDC}")
+        print(f"{Colors.BOLD}{Colors.OKCYAN}╚═════════════════════════════════════════════════════════════════════════════ ╝{Colors.ENDC}")
+        # ──────────────────────────────────────────────────────────────────────────
         
 
         # Consent gate
