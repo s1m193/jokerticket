@@ -1,21 +1,5 @@
 #!/usr/bin/env python3
-"""
-╔══════════════════════════════════════════════════════════════╗
-║        Over-Pass-the-Hash (OPtH) / Pass-the-Key             ║
-║        AD Pentesting Framework — Educational Use Only        ║
-╠══════════════════════════════════════════════════════════════╣
-║  Flow:                                                       ║
-║   1. Take stolen NT hash                                     ║
-║   2. Use it to request a Kerberos TGT from the DC (AS-REQ)  ║
-║   3. DC returns a valid TGT (accepts hash as credential)     ║
-║   4. Save TGT as .ccache file for reuse                      ║
-║   5. Use TGT to request a Service Ticket (TGS-REQ)          ║
-║   6. Access SMB/CIFS service via Kerberos (not NTLM)         ║
-║                                                              ║
-║  pip install impacket                                        ║
-║  Authorized / lab use only                                   ║
-╚══════════════════════════════════════════════════════════════╝
-"""
+
 
 import sys
 import os
@@ -72,7 +56,6 @@ BANNER = """
   ╔═══════════════════════════════════════════════════════╗
   ║     Over-Pass-the-Hash (OPtH) / Pass-the-Key          ║
   ║     NT Hash  →  Kerberos TGT  →  Domain Access        ║
-  ║     Authorized / Lab Use Only                         ║
   ╚═══════════════════════════════════════════════════════╝
 """
 
