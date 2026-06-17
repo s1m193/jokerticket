@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""
-Kerberos Shell - Multi-Service Auto-Exploitation
-SMB + WMI + WinRM Real Execution
-Production Ready v2.0 - Fixed WinRM with pypsrp + Persistent Session
-"""
+
 import os
 import sys
 import re
