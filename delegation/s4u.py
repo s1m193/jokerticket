@@ -1,100 +1,5 @@
 #!/usr/bin/env python3
-"""
-s4u.py — S4U2Self + S4U2Proxy Attack Script (Educational)
-Lab: lab.local | DC: 192.168.1.18
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-WHAT IS S4U?
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-S4U = "Service For User" — a Kerberos protocol extension by Microsoft.
-It lets a SERVICE request tickets ON BEHALF OF a user, without that
-user's password.
-
-There are two sub-protocols:
-
-  ┌─────────────────────────────────────────────────────────┐
-  │  S4U2SELF                                               │
-  │                                                         │
-  │  A service requests a ticket to ITSELF for any user.   │
-  │                                                         │
-  │  Service A → KDC:                                       │
-  │    "Give me a service ticket for UserX → Me"            │
-  │  KDC → Service A:                                       │
-  │    Here's a ticket (UserX is now impersonated)          │
-  │                                                         │
-  │  No user password needed!                               │
-  └─────────────────────────────────────────────────────────┘
-
-  ┌─────────────────────────────────────────────────────────┐
-  │  S4U2PROXY                                              │
-  │                                                         │
-  │  Service A takes that ticket and proxies it to          │
-  │  Backend Service B, still impersonating the user.       │
-  │                                                         │
-  │  Service A → KDC:                                       │
-  │    "Here's my S4U2Self ticket for UserX.                │
-  │     Now give me a ticket for UserX → Service B"         │
-  │  KDC → Service A:                                       │
-  │    Here's UserX → Service B ticket                      │
-  │                                                         │
-  │  This is CONSTRAINED DELEGATION.                        │
-  │  DC controls which services A is allowed to proxy to    │
-  │  via msDS-AllowedToDelegateTo attribute.                │
-  └─────────────────────────────────────────────────────────┘
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-ATTACK SCENARIOS COVERED IN THIS SCRIPT
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-  SCENARIO 1 — Constrained Delegation Abuse
-  ─────────────────────────────────────────
-  You have a service account (password or NT hash) that has
-  constrained delegation set (msDS-AllowedToDelegateTo).
-
-  Attack:
-    S4U2Self  → get ticket for Administrator → our service
-    S4U2Proxy → proxy that ticket to the TARGET service
-    Result    → ticket as Administrator to TARGET (e.g. cifs/DC)
-
-  SCENARIO 2 — Resource-Based Constrained Delegation (RBCD)
-  ──────────────────────────────────────────────────────────
-  You have WRITE access to a computer object's
-  msDS-AllowedToActOnBehalfOfOtherIdentity attribute.
-
-  Attack:
-    Step 1: Create a fake machine account (or use one you control)
-    Step 2: Write its SID into the target computer's
-            msDS-AllowedToActOnBehalfOfOtherIdentity
-    Step 3: S4U2Self  → get ticket for Administrator → fake machine
-    Step 4: S4U2Proxy → proxy that ticket to cifs/TARGET
-    Result  → ticket as Administrator to TARGET
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-USAGE
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-  # Enumerate delegation accounts first:
-  python3 s4u.py --enum -u Administrator -p 'Testing123!'
-
-  # Scenario 1 — Constrained Delegation:
-  python3 s4u.py --constrained \\
-    -u svc_account -p 'SvcPass123' \\
-    --impersonate Administrator \\
-    --target-spn cifs/WIN-RM9TRCNVS9P.lab.local
-
-  # Scenario 2 — RBCD:
-  python3 s4u.py --rbcd \\
-    -u svc_account -p 'SvcPass123' \\
-    --impersonate Administrator \\
-    --target-spn cifs/WIN-RM9TRCNVS9P.lab.local \\
-    --target-computer WIN-RM9TRCNVS9P
-
-  # Use NT hash instead of password:
-  python3 s4u.py --constrained -u svc_account \\
-    --nt-hash <hash> --impersonate Administrator \\
-    --target-spn cifs/WIN-RM9TRCNVS9P.lab.local
-"""
 
 import sys
 import os
@@ -134,7 +39,6 @@ BANNER = f"""
 {M}{BO}╔══════════════════════════════════════════════════════╗
 ║         S 4 U 2 S E L F  +  S 4 U 2 P R O X Y      ║
 ║      Constrained Delegation & RBCD Abuse            ║
-║      lab.local  |  192.168.1.18                     ║
 ╚══════════════════════════════════════════════════════╝{RS}
 """
 
