@@ -1,15 +1,5 @@
 #!/usr/bin/env python3
-"""
-Token Impersonation Shell
-Mirrors Metasploit's incognito module:
-  1. Connect via SMB/WMI as any admin account
-  2. list_tokens  — show delegation + impersonation tokens
-  3. impersonate_token — open shell running as chosen identity
 
-Usage:
-    python3 token_shell.py
-    python3 token_shell.py --debug
-"""
 
 import sys
 import os
@@ -90,7 +80,6 @@ def banner():
     print(f"""{C.BOLD}{C.CYAN}
   \u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557
   \u2551         Token Impersonation Shell                \u2551
-  \u2551   Mirrors Metasploit incognito module            \u2551
   \u2551   list_tokens \u2192 impersonate_token \u2192 shell        \u2551
   \u255a\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u255d
 {C.RESET}""")
