@@ -1,11 +1,5 @@
 #!/usr/bin/env python3
-"""
-Golden Certificate Attack - Unified Script (FIXED + Hardened)
-Step 0: Find CA Name
-Step 1: Backup CA Private Key
-Step 2: Forge Certificate
-Step 3: PKINIT Auth + NT Hash Extraction
-"""
+
 
 import datetime
 import os
