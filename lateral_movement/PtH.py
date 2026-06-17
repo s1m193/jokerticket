@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""
-Pass-the-Hash Remote Shell - Full & Optimized for Windows Server 2016
-2-Stage: Stage 1 disables Defender via registry, Stage 2 deploys TCP bind shell
-Authorized / lab use only.
-"""
+
 
 import sys
 import io
@@ -806,9 +802,8 @@ def interactive_shell(shell: RemoteShell):
 # ─────────────────────────────────────────────
 def main():
     cprint("╔══════════════════════════════════════════════════════╗", "CYAN", bold=True)
-    cprint("║  Pass-the-Hash Shell + Bind Shell  |  WS 2016       ║", "CYAN", bold=True)
-    cprint("║  Stage 1: Disable Defender  |  Stage 2: Bind Shell  ║", "CYAN", bold=True)
-    cprint("║              Authorized / Lab Use Only               ║", "YELLOW", bold=True)
+    cprint("║           Pass-the-Hash Shell + Bind Shell           ║", "CYAN", bold=True)
+    cprint("║                                                      ║", "CYAN", bold=True)
     cprint("╚══════════════════════════════════════════════════════╝\n", "CYAN", bold=True)
 
     if input("Continue? [y/N] ").strip().lower() not in ("y", "yes"):
