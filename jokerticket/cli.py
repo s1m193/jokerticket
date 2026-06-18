@@ -4,6 +4,9 @@ import os
 import sys
 import time
 import signal
+from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parent
 
 def _exit_handler(sig, frame):
     print(Y + "\n\n[!] Exiting... Goodbye!" + E)
@@ -173,7 +176,7 @@ def submenu(category):
             return
 
         if choice in attacks:
-            script_path = attacks[choice][1]
+            script_path = str(BASE_DIR / attacks[choice][1])
             if os.path.exists(script_path):
                 if script_path.endswith(".ps1"):
                     os.system(f"pwsh {script_path}")
