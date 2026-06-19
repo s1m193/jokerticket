@@ -305,10 +305,7 @@ class DumpSecrets:
 
     def connect(self):
         """SMB connection with support for Password, Hash, and Kerberos Ticket"""
-        # For Kerberos ticket auth:
-        # - remoteName = FQDN hostname (for correct SPN: cifs/FQDN@REALM)
-        # - remoteHost = IP (for actual TCP connection on port 445)
-        # This matches impacket's original secretsdump.py behavior exactly
+
         if self.__authType == 'ticket':
             print(Fore.YELLOW + "[*] Kerberos SPN: cifs/" + self.__remoteName + "@" + self.__domain.upper() + Style.RESET_ALL)
             print(Fore.YELLOW + "[*] SMB connecting to: " + self.__remoteHost + ":445" + Style.RESET_ALL)
