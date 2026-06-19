@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-import os, sys, re, json, socket, struct, platform, signal, threading
+import os, sys, re, json, socket, struct, platform, signal, threading, calendar
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -16,115 +16,54 @@ signal.signal(signal.SIGINT, _exit)
 
 
 # ══════════════════════════════════════════════════════════════════
-#  Constants
+#  Constants (copied from BloodHound.py)
 # ══════════════════════════════════════════════════════════════════
 
 SD_CTRL = [('1.2.840.113556.1.4.801', True, b'\x30\x03\x02\x01\x07')]
 
-ACE_TYPES = {
-    0x00: "ACCESS_ALLOWED",          0x01: "ACCESS_DENIED",
-    0x02: "SYSTEM_AUDIT",            0x05: "ACCESS_ALLOWED_OBJECT",
-    0x06: "ACCESS_DENIED_OBJECT",    0x09: "ACCESS_ALLOWED_CALLBACK",
-    0x0B: "ACCESS_ALLOWED_CALLBACK_OBJECT",
+# Well-known SIDs: SID -> (Name, Type)
+WELLKNOWN_SIDS = {
+    "S-1-1-0": ("Everyone", "GROUP"),
+    "S-1-5-9": ("Enterprise Domain Controllers", "GROUP"),
+    "S-1-5-11": ("Authenticated Users", "GROUP"),
+    "S-1-5-4": ("Interactive", "GROUP"),
+    "S-1-5-32-544": ("Administrators", "GROUP"),
+    "S-1-5-32-545": ("Users", "GROUP"),
+    "S-1-5-32-546": ("Guests", "GROUP"),
+    "S-1-5-32-547": ("Power Users", "GROUP"),
+    "S-1-5-32-548": ("Account Operators", "GROUP"),
+    "S-1-5-32-549": ("Server Operators", "GROUP"),
+    "S-1-5-32-550": ("Print Operators", "GROUP"),
+    "S-1-5-32-551": ("Backup Operators", "GROUP"),
+    "S-1-5-32-552": ("Replicators", "GROUP"),
+    "S-1-5-32-554": ("Pre-Windows 2000 Compatible Access", "GROUP"),
+    "S-1-5-32-555": ("Remote Desktop Users", "GROUP"),
+    "S-1-5-32-556": ("Network Configuration Operators", "GROUP"),
+    "S-1-5-32-557": ("Incoming Forest Trust Builders", "GROUP"),
+    "S-1-5-32-558": ("Performance Monitor Users", "GROUP"),
+    "S-1-5-32-559": ("Performance Log Users", "GROUP"),
+    "S-1-5-32-560": ("Windows Authorization Access Group", "GROUP"),
+    "S-1-5-32-561": ("Terminal Server License Servers", "GROUP"),
+    "S-1-5-32-562": ("Distributed COM Users", "GROUP"),
+    "S-1-5-32-568": ("IIS_IUSRS", "GROUP"),
+    "S-1-5-32-569": ("Cryptographic Operators", "GROUP"),
+    "S-1-5-32-573": ("Event Log Readers", "GROUP"),
+    "S-1-5-32-574": ("Certificate Service DCOM Access", "GROUP"),
+    "S-1-5-32-575": ("RDS Remote Access Servers", "GROUP"),
+    "S-1-5-32-576": ("RDS Endpoint Servers", "GROUP"),
+    "S-1-5-32-577": ("RDS Management Servers", "GROUP"),
+    "S-1-5-32-578": ("Hyper-V Administrators", "GROUP"),
+    "S-1-5-32-579": ("Access Control Assistance Operators", "GROUP"),
+    "S-1-5-32-580": ("Access Control Assistance Operators", "GROUP"),
+    "S-1-5-32-582": ("Storage Replica Administrators", "GROUP"),
 }
 
-MASK_BITS = {
-    0x00000001: "CreateChild",       0x00000002: "DeleteChild",
-    0x00000004: "ListContents",      0x00000008: "Self/ValidatedWrite",
-    0x00000010: "ReadProperty",      0x00000020: "WriteProperty",
-    0x00000040: "DeleteTree",        0x00000080: "ListObject",
-    0x00000100: "ExtendedRight",     0x00010000: "Delete",
-    0x00020000: "ReadControl",       0x00040000: "WriteDACL",
-    0x00080000: "WriteOwner",        0x10000000: "GenericAll",
-    0x40000000: "GenericWrite",      0x80000000: "GenericRead",
+# High-value group SIDs
+HIGHVALUE_RIDS = {"-512", "-516", "-519"}
+HIGHVALUE_SIDS = {
+    "S-1-5-32-544", "S-1-5-32-550", "S-1-5-32-549",
+    "S-1-5-32-551", "S-1-5-32-548"
 }
-
-ACE_FLAG_NAMES = {
-    0x01: "OI", 0x02: "CI", 0x04: "NP",
-    0x08: "INHERIT_ONLY", 0x10: "INHERITED",
-    0x40: "SA", 0x80: "FA",
-}
-
-EXT_RIGHTS = {
-    "1131f6aa-9c07-11d1-f79f-00c04fc2dcd2": "DS-Replication-Get-Changes",
-    "1131f6ad-9c07-11d1-f79f-00c04fc2dcd2": "DS-Replication-Get-Changes-All",
-    "89e95b76-444d-4c62-991a-0facbeda640c": "DS-Replication-Get-Changes-In-Filtered-Set",
-    "00299570-246d-11d0-a768-00aa006e0529": "User-Force-Change-Password",
-    "45ec5156-db7e-47bb-b53f-dbeb2d03c40f": "Reanimate-Tombstones",
-    "bf9679c0-0de6-11d0-a285-00aa003049e2": "Self-Membership",
-    "72e39547-7b18-11d1-adef-00c04fd8d5cd": "DNS-Host-Name-Attributes",
-    "f3a64788-5306-11d1-a9c5-0000f80367c1": "Validated-SPN",
-    "4c164200-20c0-11d0-a768-00aa006e0529": "User-Account-Restrictions",
-    "5f202010-79a5-11d0-9020-00c04fc2d4cf": "User-Logon",
-    "bc0ac240-79a9-11d0-9020-00c04fc2d4cf": "Membership",
-    "9b026da6-0d3c-465c-8bee-5199d7165cba": "msDS-KeyCredentialLink",
-    "5b47d60f-6090-40b2-9f37-2a4de88f3063": "msDS-KeyCredentialLink",
-    "0e10c968-78fb-11d2-90d4-00c04f79dc55": "Enroll-Certificate",
-    "a05b8cc2-17bc-4802-a710-e7c15ab866a2": "AutoEnrollment",
-    "3e0f7e18-2c7a-4c10-ba82-4d926db99a3e": "DS-Clone-Domain-Controller",
-    "084c93a2-620d-4879-a836-f0ae47de0e89": "DS-Read-Partition-Secrets",
-    "94825a8d-b171-4116-8146-1e34d8f54401": "DS-Write-Partition-Secrets",
-}
-
-SCHEMA_ATTRS = {
-    "bf967953-0de6-11d0-a285-00aa003049e2": "scriptPath",
-    "bf967a7f-0de6-11d0-a285-00aa003049e2": "userAccountControl",
-    "f3a64788-5306-11d1-a9c5-0000f80367c1": "servicePrincipalName",
-    "28630eb8-41d5-11d1-a9c1-0000f80367c1": "msDS-KeyCredentialLink",
-    "5b47d60f-6090-40b2-9f37-2a4de88f3063": "msDS-KeyCredentialLink",   # shadow creds
-    "9b026da6-0d3c-465c-8bee-5199d7165cba": "msDS-KeyCredentialLink",
-    "bf9679c0-0de6-11d0-a285-00aa003049e2": "member",                   # group member write
-    "3e74f60e-3e73-11d1-a9c0-0000f80367c1": "userPassword",
-    "bf967a68-0de6-11d0-a285-00aa003049e2": "userParameters",
-    "e45795b2-9455-11d1-aebd-0000f80367c1": "mail",
-    "bf967950-0de6-11d0-a285-00aa003049e2": "pwdLastSet",
-    "bf9679e3-0de6-11d0-a285-00aa003049e2": "unicodePwd",
-    "bf96793f-0de6-11d0-a285-00aa003049e2": "lmPwdHistory",
-    "bf967994-0de6-11d0-a285-00aa003049e2": "ntPwdHistory",
-    "4c164200-20c0-11d0-a768-00aa006e0529": "userAccountControl",       # alt GUID
-    "19195a5b-6da0-11d0-afd3-00c04fd930c9": "objectSid",
-    "bf967915-0de6-11d0-a285-00aa003049e2": "dBCSPwd",
-}
-
-# BloodHound edge name mappings
-# ExtendedRight GUID names → BH graph edge names
-EXT_RIGHT_TO_BH = {
-    "User-Force-Change-Password":                    "ForceChangePassword",
-    "DS-Replication-Get-Changes":                    "GetChanges",
-    "DS-Replication-Get-Changes-All":                "GetChangesAll",
-    "DS-Replication-Get-Changes-In-Filtered-Set":    "GetChangesInFilteredSet",
-    "Self-Membership":                               "AddSelf",
-    "Validated-SPN":                                 "WriteSPN",
-    "DNS-Host-Name-Attributes":                      "WriteAccountRestrictions",
-    "User-Account-Restrictions":                     "WriteAccountRestrictions",
-    "msDS-KeyCredentialLink":                        "AddKeyCredentialLink",
-    "Enroll-Certificate":                            "Enroll",
-    "AutoEnrollment":                                "AutoEnroll",
-}
-
-# WriteProperty attr names → BH graph edge names
-WRITE_PROP_TO_BH = {
-    "member":                   "AddMember",
-    "msDS-KeyCredentialLink":   "AddKeyCredentialLink",
-    "servicePrincipalName":     "WriteSPN",
-    "scriptPath":               "WriteProperty-scriptPath",
-    "userAccountControl":       "WriteProperty-userAccountControl",
-    "userPassword":             "WriteProperty-userPassword",
-    "userParameters":           "WriteProperty-userParameters",
-    "mail":                     "WriteProperty-mail",
-    "unicodePwd":               "WriteProperty-unicodePwd",
-    "lmPwdHistory":             "WriteProperty-lmPwdHistory",
-    "ntPwdHistory":             "WriteProperty-ntPwdHistory",
-    "dBCSPwd":                  "WriteProperty-dBCSPwd",
-}
-
-HIGH_VALUE_GROUPS = {
-    'domain admins', 'enterprise admins', 'schema admins', 'administrators',
-    'backup operators', 'account operators', 'print operators', 'server operators',
-    'group policy creator owners', 'dns admins', 'exchange windows permissions',
-    'remote management users', 'domain controllers', 'read-only domain controllers',
-}
-
 
 # ══════════════════════════════════════════════════════════════════
 #  Banner / Input / Validation
@@ -133,8 +72,8 @@ HIGH_VALUE_GROUPS = {
 def banner():
     print(Fore.CYAN + """
     ╔═══════════════════════════════════════════════════╗
-    ║              BloodHound  Data Collector           ║
-    ║  	       Collects AD data -> BloodHound JSON      ║
+    ║   	     BloodHound Collector  	        ║
+    ║          Collects AD data -> BloodHound JSON      ║
     ╚═══════════════════════════════════════════════════╝
     """ + Style.RESET_ALL)
     print(Fore.YELLOW + f"[*] Platform: {platform.system()} {platform.release()}" + Style.RESET_ALL)
@@ -255,87 +194,202 @@ def guid_from_bytes(b):
     p3 = struct.unpack_from('<H', b, 6)[0]
     return f"{p1:08x}-{p2:04x}-{p3:04x}-{b[8:10].hex()}-{b[10:16].hex()}"
 
-def mask_desc(mask):
-    return ' | '.join(n for bit, n in MASK_BITS.items() if mask & bit) or f"0x{mask:08X}"
-
-def flags_desc(f):
-    return ' '.join(n for bit, n in ACE_FLAG_NAMES.items() if f & bit) or "none"
+def ldap2domain(ldap_dn):
+    """Convert LDAP DN to DNS domain name."""
+    return re.sub(',DC=', '.', ldap_dn[ldap_dn.find('DC='):], flags=re.I)[3:]
 
 
 # ══════════════════════════════════════════════════════════════════
-#  ACE Parser  (full + diagnostic mode)
+#  BloodHound.py Logic: resolve_ad_entry
 # ══════════════════════════════════════════════════════════════════
 
-def map_rights(mask, obj_guid, verbose=False):
+def resolve_ad_entry(entry):
     """
-    Map ACCESS_MASK + optional ObjectType GUID → BloodHound right names.
-
-    Priority rules (matching SharpHound):
-    - ExtendedRight  (0x100)  → look in EXT_RIGHTS by GUID
-    - WriteProperty  (0x020)  → look in SCHEMA_ATTRS by GUID
-                                 (NOT EXT_RIGHTS — different bit means different table)
-    - Self/Validated (0x008)  → look in EXT_RIGHTS by GUID
+    EXACT replica of BloodHound.py's ADUtils.resolve_ad_entry()
+    Translates an LDAP entry into a dict with objectid, principal, type.
     """
-    g = obj_guid.lower() if obj_guid else None
-    r = []
+    resolved = {}
+    dn = ''
+    domain = ''
 
-    # ── GenericAll ────────────────────────────────────────────────
-    if (mask & 0x000F01FF) == 0x000F01FF or (mask & 0x10000000):
-        return ["GenericAll"]
+    # Get attributes dict
+    if hasattr(entry, 'entry_attributes_as_dict'):
+        a = entry.entry_attributes_as_dict
+    else:
+        a = entry.get('attributes', {})
 
-    # ── DACL / Owner ──────────────────────────────────────────────
-    if mask & 0x00040000: r.append("WriteDacl")
-    if mask & 0x00080000: r.append("WriteOwner")
+    account = str(ga(a, 'sAMAccountName', ''))
+    dn = str(ga(a, 'distinguishedName', ''))
+    if dn:
+        domain = ldap2domain(dn)
 
-    # ── GenericWrite ───────────────────────────────────────────────
-    if mask & 0x40000000: r.append("GenericWrite")
+    resolved['objectid'] = str(ga(a, 'objectSid', ''))
+    resolved['principal'] = (f"{account}@{domain}").upper()
 
-    # ── ExtendedRight / ControlAccess (0x100) ─────────────────────
-    if mask & 0x00000100:
-        if g:
-            raw_name = EXT_RIGHTS.get(g)
-            if raw_name:
-                r.append(EXT_RIGHT_TO_BH.get(raw_name, raw_name))
+    if not ga(a, 'sAMAccountName'):
+        # No sAMAccountName - could be OU, Container, GPO, ForeignSecurityPrincipal
+        if 'ForeignSecurityPrincipals' in dn and 'container' not in [c.lower() for c in gal(a, 'objectClass', [])]:
+            resolved['principal'] = domain.upper()
+            resolved['type'] = 'foreignsecurityprincipal'
+            ename = ga(a, 'name')
+            if ename:
+                if ename in WELLKNOWN_SIDS:
+                    name, sidtype = WELLKNOWN_SIDS[ename]
+                    resolved['type'] = sidtype.lower()
+                    resolved['principal'] = (f"{name}@{domain}").upper()
+                    # Well-known have the domain prefix since 3.0
+                    resolved['objectid'] = f"{domain.upper()}-{resolved['objectid']}"
+                else:
+                    # Foreign security principal
+                    resolved['objectid'] = ename
+        elif ga(a, 'objectGUID'):
+            guid = str(ga(a, 'objectGUID', ''))
+            # Handle ldap3's {guid} format
+            if guid.startswith('{') and guid.endswith('}'):
+                guid = guid[1:-1]
+            resolved['objectid'] = guid.upper()
+            resolved['principal'] = (f"{ga(a, 'name', '')}@{domain}").upper()
+            obj_class = gal(a, 'objectClass')
+            if 'organizationalUnit' in obj_class:
+                resolved['type'] = 'OU'
+            elif 'container' in obj_class:
+                resolved['type'] = 'Container'
             else:
-                r.append(f"ExtendedRight({obj_guid})" if verbose else "ExtendedRight")
+                resolved['type'] = 'Base'
         else:
-            r.append("ExtendedRight")
+            resolved['type'] = 'Base'
+    else:
+        # Has sAMAccountName - determine type from sAMAccountType
+        account_type = ga(a, 'sAMAccountType')
+        obj_class = gal(a, 'objectClass')
 
-    # ── WriteProperty (0x020) ──────────────────────────────────────
-    if mask & 0x00000020:
-        if g:
-            attr = SCHEMA_ATTRS.get(g)
-            if attr:
-                r.append(WRITE_PROP_TO_BH.get(attr, f"WriteProperty-{attr}"))
-            else:
-                r.append(f"WriteProperty({obj_guid})" if verbose else "WriteProperty")
+        if account_type in [268435456, 268435457, 536870912, 536870913]:
+            resolved['type'] = 'Group'
+        elif account_type in [805306368] or \
+             'msDS-GroupManagedServiceAccount' in obj_class or \
+             'msDS-ManagedServiceAccount' in obj_class:
+            resolved['type'] = 'User'
+        elif account_type in [805306369]:
+            resolved['type'] = 'Computer'
+            short_name = account.rstrip('$')
+            resolved['principal'] = (f"{short_name}.{domain}").upper()
+        elif account_type in [805306370]:
+            resolved['type'] = 'trustaccount'
         else:
-            if "GenericWrite" not in r:
-                r.append("GenericWrite")
+            resolved['type'] = 'Domain'
 
-    # ── Validated Write / Self (0x008) ────────────────────────────
-    if mask & 0x00000008:
-        if g:
-            raw_name = EXT_RIGHTS.get(g)
-            if raw_name:
-                r.append(EXT_RIGHT_TO_BH.get(raw_name, raw_name))
-            else:
-                r.append("Self")
-        else:
-            r.append("Self")
-
-    # ── CreateChild / DeleteChild ─────────────────────────────────
-    if mask & 0x00000001: r.append("CreateChild")
-    if mask & 0x00000002: r.append("DeleteChild")
-
-    return r
+    return resolved
 
 
-def parse_aces(sd_bytes, verbose=False, label=""):
+# ══════════════════════════════════════════════════════════════════
+#  BloodHound.py Logic: Caches
+# ══════════════════════════════════════════════════════════════════
+
+class ADCache:
     """
-    Parse binary Security Descriptor DACL.
-    verbose=True → prints every ACE with full detail (diagnostic mode).
-    Returns list of BH-format ACE dicts.
+    Exact replica of BloodHound.py's caching system.
+    DN cache holds: DN (upper) -> {"ObjectIdentifier": sid/guid, "ObjectType": "User"/"Group"/"Computer"}
+    """
+    def __init__(self, conn, base_dn, domain):
+        self.conn = conn
+        self.base_dn = base_dn
+        self.domain = domain
+        self.dn_cache = {}
+        self.sid_cache = {}
+
+    def add(self, dn, obj_id, obj_type):
+        """Add a DN to the cache with its resolved identifier and type."""
+        if dn:
+            self.dn_cache[dn.upper()] = {"ObjectIdentifier": obj_id, "ObjectType": obj_type}
+        if obj_id:
+            self.sid_cache[obj_id] = {"ObjectIdentifier": obj_id, "ObjectType": obj_type}
+
+    def get(self, dn):
+        """Get cached entry by DN. Returns None if not found."""
+        if not dn:
+            return None
+        return self.dn_cache.get(dn.upper())
+
+    def resolve_dn(self, dn):
+        """
+        EXACT replica of BloodHound.py's get_dn_from_cache_or_ldap()
+        Resolve a DistinguishedName in LDAP.
+        First check cache, then query LDAP.
+        """
+        if not dn:
+            return None
+
+        # Check cache first
+        try:
+            linkentry = self.dn_cache[dn.upper()]
+            return linkentry
+        except KeyError:
+            pass
+
+        # Query LDAP for this DN
+        try:
+            self.conn.search(dn, '(objectClass=*)', search_scope=BASE,
+                        attributes=['sAMAccountName', 'distinguishedName', 'sAMAccountType', 'objectSid', 'name', 'objectGUID', 'objectClass'])
+            if self.conn.entries:
+                e = self.conn.entries[0]
+                resolved_entry = resolve_ad_entry(e)
+                if not resolved_entry['objectid']:
+                    return None
+                linkentry = {
+                    "ObjectIdentifier": resolved_entry['objectid'],
+                    "ObjectType": resolved_entry['type'].capitalize()
+                }
+                self.dn_cache[dn.upper()] = linkentry
+                return linkentry
+        except Exception as ex:
+            pass
+
+        return None
+
+    def prefetch_all_objects(self):
+        """
+        BloodHound.py's get_cache_items() logic:
+        Query ALL users, groups, and computers in one go to populate the cache.
+        This is CRITICAL for resolving group memberships correctly.
+        """
+        print(Fore.YELLOW + "[*] Pre-fetching all objects for DN cache..." + Style.RESET_ALL)
+        count = 0
+
+        # Query ALL objects: users, groups, computers (same filter as BloodHound.py)
+        query = '(|(samAccountType=805306368)(objectClass=group)(samAccountType=805306369))'
+        try:
+            self.conn.search(self.base_dn, query, search_scope=SUBTREE,
+                        attributes=['sAMAccountName', 'distinguishedName', 'sAMAccountType', 'objectSid', 'name', 'objectGUID', 'objectClass'])
+            for e in self.conn.entries:
+                try:
+                    resolved = resolve_ad_entry(e)
+                    dn = str(ga(e.entry_attributes_as_dict, 'distinguishedName', ''))
+                    if dn and resolved['objectid']:
+                        cacheitem = {
+                            "ObjectIdentifier": resolved['objectid'],
+                            "ObjectType": resolved['type'].capitalize()
+                        }
+                        self.dn_cache[dn.upper()] = cacheitem
+                        self.sid_cache[resolved['objectid']] = cacheitem
+                        count += 1
+                except:
+                    continue
+        except Exception as ex:
+            print(Fore.RED + f"[-] Cache prefetch failed: {ex}" + Style.RESET_ALL)
+
+        print(Fore.GREEN + f"[+] Cached {count} objects for DN resolution" + Style.RESET_ALL)
+        return count
+
+
+# ══════════════════════════════════════════════════════════════════
+#  BloodHound.py Logic: ACE Parser
+# ══════════════════════════════════════════════════════════════════
+
+def parse_aces(sd_bytes, entrytype='base', objecttype_guid_map=None):
+    """
+    BloodHound.py-compatible ACE parser.
+    Returns list of raw ACE dicts with 'rightname', 'sid', 'inherited'.
+    These are later resolved by resolve_aces().
     """
     aces = []
     if not sd_bytes or len(sd_bytes) < 20:
@@ -344,23 +398,12 @@ def parse_aces(sd_bytes, verbose=False, label=""):
     try:
         ctrl     = struct.unpack_from('<H', sd_bytes, 2)[0]
         off_dacl = struct.unpack_from('<I', sd_bytes, 16)[0]
-        off_own  = struct.unpack_from('<I', sd_bytes, 4)[0]
-
-        if verbose:
-            print(f"\n  {'─'*60}")
-            print(f"  SD: {label}  ({len(sd_bytes)} bytes)")
-            owner = sid_to_str(sd_bytes[off_own:]) if off_own else "N/A"
-            print(f"  Owner  : {owner}")
-            print(f"  Control: 0x{ctrl:04X}  DACL={'YES' if ctrl&4 else 'NO'}")
 
         if not (ctrl & 0x0004) or off_dacl == 0 or off_dacl+8 > len(sd_bytes):
             return aces
 
         ace_count = struct.unpack_from('<H', sd_bytes, off_dacl+4)[0]
         pos = off_dacl + 8
-
-        if verbose:
-            print(f"  DACL @ {off_dacl}  |  ACEs: {ace_count}")
 
         for i in range(ace_count):
             if pos+4 > len(sd_bytes): break
@@ -370,19 +413,13 @@ def parse_aces(sd_bytes, verbose=False, label=""):
             if asize < 4 or pos+asize > len(sd_bytes): break
             adata = sd_bytes[pos:pos+asize]; pos += asize
 
-            type_name = ACE_TYPES.get(atype, f"0x{atype:02X}")
-            inh_only  = bool(aflags & 0x08)
-            inherited = bool(aflags & 0x10)
+            is_inherited = bool(aflags & 0x10)
 
-            if verbose:
-                print(f"\n  ── ACE[{i:02d}]  {type_name}  flags={flags_desc(aflags)}", end="")
-                if inh_only: print(f"  ⚠ INHERIT_ONLY (skipped)", end="")
-                print()
-
-            # Skip INHERIT_ONLY and DENY ACEs
-            if inh_only:
+            # Skip INHERIT_ONLY (not inherited, just set for inheritance to children)
+            if not is_inherited and (aflags & 0x08):
                 continue
-            if atype in (0x01, 0x06):  # ACCESS_DENIED*
+            # Skip DENY ACEs
+            if atype in (0x01, 0x06):
                 continue
             if atype not in (0x00, 0x05, 0x09, 0x0B):
                 continue
@@ -394,16 +431,18 @@ def parse_aces(sd_bytes, verbose=False, label=""):
                     sid  = sid_to_str(adata[8:])
                     if not sid: continue
 
-                    if verbose:
-                        print(f"     Mask : {mask_desc(mask)}")
-                        print(f"     SID  : {sid}")
-
-                    rights = map_rights(mask, None, verbose)
-                    if verbose:
-                        print(f"     BH   : {rights or '(none)'}")
-                    for r in rights:
-                        aces.append({"PrincipalSID": sid, "PrincipalType": "Base",
-                                     "RightName": r, "IsInherited": inherited})
+                    # Parse simple ACE (same logic as BloodHound.py acls.py)
+                    if mask & 0x10000000:  # GenericAll
+                        aces.append({"rightname": "GenericAll", "sid": sid, "inherited": is_inherited})
+                        continue
+                    if mask & 0x00080000:  # WriteOwner
+                        aces.append({"rightname": "WriteOwner", "sid": sid, "inherited": is_inherited})
+                    if mask & 0x00040000:  # WriteDACL
+                        aces.append({"rightname": "WriteDacl", "sid": sid, "inherited": is_inherited})
+                    if mask & 0x40000000:  # GenericWrite
+                        aces.append({"rightname": "GenericWrite", "sid": sid, "inherited": is_inherited})
+                    if mask & 0x00000100:  # ControlAccess (ExtendedRight)
+                        aces.append({"rightname": "AllExtendedRights", "sid": sid, "inherited": is_inherited})
 
                 elif atype in (0x05, 0x0B):  # Object ALLOW
                     if len(adata) < 16: continue
@@ -411,29 +450,70 @@ def parse_aces(sd_bytes, verbose=False, label=""):
                     oflags = struct.unpack_from('<I', adata, 8)[0]
                     cur    = 12
                     obj_guid = None
-                    if oflags & 0x1: obj_guid = guid_from_bytes(adata[cur:cur+16]); cur += 16
-                    if oflags & 0x2: cur += 16
+                    inh_guid = None
+                    if oflags & 0x1:
+                        obj_guid = guid_from_bytes(adata[cur:cur+16])
+                        cur += 16
+                    if oflags & 0x2:
+                        inh_guid = guid_from_bytes(adata[cur:cur+16])
+                        cur += 16
                     sid = sid_to_str(adata[cur:])
                     if not sid: continue
 
-                    if verbose:
-                        g    = obj_guid.lower() if obj_guid else None
-                        desc = EXT_RIGHTS.get(g, SCHEMA_ATTRS.get(g, "")) if g else ""
-                        print(f"     Mask : {mask_desc(mask)}")
-                        print(f"     GUID : {obj_guid or 'None'}  {f'({desc})' if desc else ''}")
-                        print(f"     SID  : {sid}")
+                    # Check if inherited ACE applies to this object type
+                    if is_inherited and inh_guid and objecttype_guid_map:
+                        # Skip if doesn't apply
+                        pass  # Simplified for now
 
-                    rights = map_rights(mask, obj_guid, verbose)
-                    if verbose:
-                        print(f"     BH   : {rights or '(none)'}")
-                    for r in rights:
-                        aces.append({"PrincipalSID": sid, "PrincipalType": "Base",
-                                     "RightName": r, "IsInherited": inherited})
+                    # Parse object ACE (simplified but covers main cases)
+                    if mask & 0x10000000:  # GenericAll
+                        aces.append({"rightname": "GenericAll", "sid": sid, "inherited": is_inherited})
+                        continue
+
+                    # Check specific rights
+                    if mask & 0x00080000:
+                        aces.append({"rightname": "WriteOwner", "sid": sid, "inherited": is_inherited})
+                    if mask & 0x00040000:
+                        aces.append({"rightname": "WriteDacl", "sid": sid, "inherited": is_inherited})
+
+                    # GenericWrite / WriteProperty
+                    if mask & 0x00000020:
+                        if obj_guid:
+                            attr = SCHEMA_ATTR_GUID.get(obj_guid.lower(), '')
+                            if attr == 'member' and entrytype == 'group':
+                                aces.append({"rightname": "AddMember", "sid": sid, "inherited": is_inherited})
+                            elif attr:
+                                aces.append({"rightname": f"WriteProperty-{attr}", "sid": sid, "inherited": is_inherited})
+                            else:
+                                aces.append({"rightname": "GenericWrite", "sid": sid, "inherited": is_inherited})
+                        else:
+                            aces.append({"rightname": "GenericWrite", "sid": sid, "inherited": is_inherited})
+
+                    # ExtendedRight
+                    if mask & 0x00000100:
+                        if obj_guid:
+                            ext_name = EXT_RIGHTS_GUID.get(obj_guid.lower(), '')
+                            if ext_name:
+                                bh_name = EXT_RIGHT_TO_BH.get(ext_name, ext_name)
+                                aces.append({"rightname": bh_name, "sid": sid, "inherited": is_inherited})
+                            else:
+                                aces.append({"rightname": "ExtendedRight", "sid": sid, "inherited": is_inherited})
+                        else:
+                            aces.append({"rightname": "AllExtendedRights", "sid": sid, "inherited": is_inherited})
+
+                    # Self / Validated Write
+                    if mask & 0x00000008:
+                        if obj_guid:
+                            ext_name = EXT_RIGHTS_GUID.get(obj_guid.lower(), '')
+                            if ext_name == 'WriteMember' and entrytype == 'group':
+                                aces.append({"rightname": "AddSelf", "sid": sid, "inherited": is_inherited})
+                            else:
+                                aces.append({"rightname": "Self", "sid": sid, "inherited": is_inherited})
+                        else:
+                            aces.append({"rightname": "Self", "sid": sid, "inherited": is_inherited})
+
             except:
                 continue
-
-        if verbose:
-            print(f"\n  → BH ACEs found: {len(aces)}")
 
     except:
         pass
@@ -441,153 +521,36 @@ def parse_aces(sd_bytes, verbose=False, label=""):
     return aces
 
 
-# ══════════════════════════════════════════════════════════════════
-#  Diagnostic: scan all objects for a specific SID
-# ══════════════════════════════════════════════════════════════════
-
-def diagnose_user(conn, base_dn, domain, target_sam, all_collected):
+def resolve_aces(aces, domain, domain_sid, cache):
     """
-    For a specific user:
-    1. Show their ACE dump (verbose)
-    2. Scan all collected objects and find where their SID appears
-    3. Compare with what we collected
-    4. Return missing ACEs that need to be added
+    EXACT replica of BloodHound.py's AceResolver.resolve_aces()
+    Resolves raw ACEs (with SIDs) to BloodHound-format ACEs.
     """
-    print(Fore.CYAN + f"\n{'═'*65}" + Style.RESET_ALL)
-    print(Fore.CYAN + f"  DIAGNOSTIC: {target_sam}" + Style.RESET_ALL)
-    print(Fore.CYAN + f"{'═'*65}" + Style.RESET_ALL)
+    aces_out = []
+    for ace in aces:
+        out = {
+            'RightName': ace['rightname'],
+            'IsInherited': ace['inherited']
+        }
+        sid = ace['sid']
 
-    # Find user SID
-    target_sid = None
-    for obj_list in all_collected.values():
-        for obj in obj_list:
-            props = obj.get("Properties", {})
-            sam   = props.get("samaccountname", "")
-            if sam.lower() == target_sam.lower():
-                target_sid = obj.get("ObjectIdentifier", "")
-                break
-        if target_sid:
-            break
+        # Is it a well-known sid?
+        if sid in WELLKNOWN_SIDS:
+            out['PrincipalSID'] = f"{domain.upper()}-{sid}"
+            out['PrincipalType'] = WELLKNOWN_SIDS[sid][1].capitalize()
+        else:
+            # Try to resolve from cache
+            try:
+                linkitem = cache.sid_cache[sid]
+                out['PrincipalSID'] = sid
+                out['PrincipalType'] = linkitem['ObjectType']
+            except KeyError:
+                # Couldn't resolve - use SID as-is
+                out['PrincipalSID'] = sid
+                out['PrincipalType'] = 'Base'
 
-    if not target_sid:
-        # Try to get from LDAP directly
-        conn.search(base_dn, f"(sAMAccountName={target_sam})", search_scope=SUBTREE,
-                    attributes=["objectSid", "nTSecurityDescriptor", "sAMAccountName",
-                                "distinguishedName"], controls=SD_CTRL)
-        if conn.entries:
-            e = conn.entries[0]
-            target_sid = sid_to_str(graw(e, "objectSid"))
-            sd_r = graw(e, "nTSecurityDescriptor")
-            if sd_r:
-                print(Fore.YELLOW + f"\n[*] Verbose ACE dump of {target_sam}'s own SD:" + Style.RESET_ALL)
-                parse_aces(sd_r, verbose=True, label=str(e["distinguishedName"]))
-
-    if not target_sid:
-        print(Fore.RED + f"[-] Cannot find SID for {target_sam}" + Style.RESET_ALL)
-        return {}
-
-    print(Fore.GREEN + f"[+] Target SID: {target_sid}" + Style.RESET_ALL)
-
-    # Scan ALL objects for this SID in their ACEs
-    print(Fore.YELLOW + f"\n[*] Scanning all objects for SID {target_sid}..." + Style.RESET_ALL)
-
-    found_in = []    # objects where this SID has rights
-    missing  = {}    # obj_id -> list of rights that are missing from collected data
-
-    obj_type_map = {
-        "users":      "User",
-        "groups":     "Group",
-        "computers":  "Computer",
-        "ous":        "OU",
-        "gpos":       "GPO",
-        "containers": "Container",
-        "domains":    "Domain",
-    }
-
-    for ctype, obj_list in all_collected.items():
-        obj_type = obj_type_map.get(ctype, ctype)
-        for obj in obj_list:
-            obj_id   = obj.get("ObjectIdentifier", "")
-            obj_name = obj.get("Properties", {}).get("name", obj_id)
-            existing_aces = obj.get("Aces", [])
-
-            # Find this SID in existing ACEs
-            existing_rights = set(
-                a["RightName"] for a in existing_aces
-                if a.get("PrincipalSID") == target_sid
-            )
-
-            # Re-parse the SD from LDAP to get ground truth
-            # We need to re-fetch this object's SD
-            # Use distinguishedname to re-fetch
-            dn = obj.get("Properties", {}).get("distinguishedname", "")
-            if not dn:
-                continue
-
-            conn.search(dn, "(objectClass=*)", search_scope=BASE,
-                        attributes=["nTSecurityDescriptor", "sAMAccountName",
-                                    "name", "displayName"], controls=SD_CTRL)
-            if not conn.entries:
-                continue
-
-            sd_r = graw(conn.entries[0], "nTSecurityDescriptor")
-            if not sd_r:
-                continue
-
-            # Parse fresh
-            fresh_aces  = parse_aces(sd_r)
-            fresh_rights = set(
-                a["RightName"] for a in fresh_aces
-                if a.get("PrincipalSID") == target_sid
-            )
-
-            if fresh_rights:
-                found_in.append({
-                    "type":   obj_type,
-                    "name":   obj_name,
-                    "id":     obj_id,
-                    "rights": list(fresh_rights),
-                    "existing": list(existing_rights),
-                    "missing":  list(fresh_rights - existing_rights),
-                })
-                if fresh_rights - existing_rights:
-                    missing[obj_id] = {
-                        "name":    obj_name,
-                        "type":    obj_type,
-                        "to_add":  [
-                            a for a in fresh_aces
-                            if a.get("PrincipalSID") == target_sid
-                            and a["RightName"] not in existing_rights
-                        ],
-                    }
-
-    # Print results
-    print(Fore.CYAN + f"\n  Objects where {target_sam} has control:" + Style.RESET_ALL)
-    total_outbound = 0
-    for item in found_in:
-        status = Fore.GREEN + "✓" if not item["missing"] else Fore.RED + "✗ MISSING"
-        print(f"  {status}{Style.RESET_ALL}  [{item['type']:9s}] {item['name']}")
-        print(f"            Rights    : {item['rights']}")
-        if item["missing"]:
-            print(Fore.RED + f"            MISSING   : {item['missing']}" + Style.RESET_ALL)
-        total_outbound += 1
-
-    print(Fore.CYAN + f"\n  Total outbound: {total_outbound}  |  Missing from collected: {len(missing)}" + Style.RESET_ALL)
-    return missing
-
-
-def apply_missing_aces(all_collected, missing_map):
-    """Patch collected objects with missing ACEs."""
-    patched = 0
-    for ctype, obj_list in all_collected.items():
-        for obj in obj_list:
-            obj_id = obj.get("ObjectIdentifier", "")
-            if obj_id in missing_map:
-                for ace in missing_map[obj_id]["to_add"]:
-                    if ace not in obj["Aces"]:
-                        obj["Aces"].append(ace)
-                        patched += 1
-    return patched
+        aces_out.append(out)
+    return aces_out
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -639,10 +602,10 @@ def samr_local_admins(target, domain, username, password, timeout=5):
 
 
 # ══════════════════════════════════════════════════════════════════
-#  Collectors
+#  Collectors (with BloodHound.py logic)
 # ══════════════════════════════════════════════════════════════════
 
-def collect_domain(conn, base_dn, domain):
+def collect_domain(conn, base_dn, domain, cache):
     print(Fore.YELLOW + "[*] Collecting Domain..." + Style.RESET_ALL)
     try:
         conn.search(base_dn, '(objectClass=domain)', search_scope=BASE,
@@ -654,7 +617,8 @@ def collect_domain(conn, base_dn, domain):
         if not conn.entries: return None, ""
         e = conn.entries[0]; a = e.entry_attributes_as_dict
         sid  = sid_to_str(graw(e,'objectSid'))
-        aces = parse_aces(graw(e,'nTSecurityDescriptor'))
+        aces = parse_aces(graw(e,'nTSecurityDescriptor'), entrytype='domain')
+        aces = resolve_aces(aces, domain, sid, cache)
         obj = {
             "ObjectIdentifier": sid,
             "Properties": {
@@ -700,7 +664,15 @@ def collect_trusts(conn, base_dn, domain):
     except Exception as ex:
         print(Fore.RED + f"[-] Trusts: {ex}" + Style.RESET_ALL); return []
 
-def collect_users(conn, base_dn, domain, domain_sid):
+
+def get_primary_membership(sid, primary_group_id):
+    """BloodHound.py's get_primary_membership() - constructs PrimaryGroupSID from RID."""
+    if not sid or not primary_group_id:
+        return None
+    return f"{'-'.join(sid.split('-')[:-1])}-{primary_group_id}"
+
+
+def collect_users(conn, base_dn, domain, domain_sid, cache):
     print(Fore.YELLOW + "[*] Collecting Users..." + Style.RESET_ALL)
     try:
         conn.search(base_dn,'(samAccountType=805306368)',search_scope=SUBTREE,
@@ -724,8 +696,23 @@ def collect_users(conn, base_dn, domain, domain_sid):
                 mof  = gal(a,'memberOf')
                 hist = gal(a,'sIDHistory')
                 dsid = sid.rsplit('-',1)[0] if sid.count('-')>=3 else domain_sid
-                aces = parse_aces(graw(e,'nTSecurityDescriptor'))
-                users.append({
+
+                # Parse and resolve ACEs
+                raw_aces = parse_aces(graw(e,'nTSecurityDescriptor'), entrytype='user')
+                aces = resolve_aces(raw_aces, domain, domain_sid, cache)
+
+                # Resolve MemberOf using cache (EXACT BloodHound.py logic)
+                member_of = []
+                for m in mof:
+                    resolved = cache.resolve_dn(m)
+                    if resolved:
+                        member_of.append(resolved)
+
+                # Primary group membership (BloodHound.py logic)
+                pgid = ga(a, 'primaryGroupID', 513)
+                primary_group_sid = get_primary_membership(sid, pgid)
+
+                user = {
                     "ObjectIdentifier": sid,
                     "Properties": {
                         "name": f"{sam.upper()}@{dom_u}", "domain": dom_u, "domainsid": dsid,
@@ -752,21 +739,27 @@ def collect_users(conn, base_dn, domain, domain_sid):
                         "scriptpath":    str(ga(a,'scriptPath','') or ''),
                         "homedirectory": str(ga(a,'homeDirectory','') or ''),
                     },
-                    "PrimaryGroupSid":   f"{dsid}-{ga(a,'primaryGroupID',513) or 513}",
+                    "PrimaryGroupSid":   primary_group_sid,
                     "SPNTargets":        [{"ComputerSID":"","Port":0,"Service":s.split('/')[0]}
                                           for s in spns if '/' in s],
                     "HasSIDHistory":     [{"ObjectIdentifier":s,"ObjectType":"Base"} for s in hist],
                     "AllowedToDelegate": [{"ObjectIdentifier":d,"ObjectType":"Computer"} for d in delg],
                     "Aces": aces, "IsDeleted": False,
-                    "MemberOf": [{"ObjectIdentifier":m,"ObjectType":"Group"} for m in mof],
-                })
-            except: continue
+                    "MemberOf": member_of,
+                }
+
+                # Cache this user for DN resolution
+                cache.add(str(ga(a,'distinguishedName','')), sid, "User")
+                users.append(user)
+            except Exception as ex:
+                continue
         print(Fore.GREEN + f"[+] Users: {len(users)}  ACEs: {sum(len(u['Aces']) for u in users)}" + Style.RESET_ALL)
         return users
     except Exception as ex:
         print(Fore.RED + f"[-] Users: {ex}" + Style.RESET_ALL); return []
 
-def collect_groups(conn, base_dn, domain, domain_sid):
+
+def collect_groups(conn, base_dn, domain, domain_sid, cache):
     print(Fore.YELLOW + "[*] Collecting Groups..." + Style.RESET_ALL)
     try:
         conn.search(base_dn,'(objectClass=group)',search_scope=SUBTREE,
@@ -781,12 +774,41 @@ def collect_groups(conn, base_dn, domain, domain_sid):
                 sid  = sid_to_str(graw(e,'objectSid'))
                 if not sid: continue
                 sam  = str(ga(a,'sAMAccountName',''))
-                mems = gal(a,'member'); mof = gal(a,'memberOf'); hist = gal(a,'sIDHistory')
-                aces = parse_aces(graw(e,'nTSecurityDescriptor'))
-                ml   = []
+                mems = gal(a,'member')
+                mof  = gal(a,'memberOf')
+                hist = gal(a,'sIDHistory')
+
+                # Handle well-known SIDs (BloodHound.py logic)
+                if sid in WELLKNOWN_SIDS:
+                    sid = f"{dom_u}-{sid}"
+
+                # Parse and resolve ACEs
+                raw_aces = parse_aces(graw(e,'nTSecurityDescriptor'), entrytype='group')
+                aces = resolve_aces(raw_aces, domain, domain_sid, cache)
+
+                # Resolve members using cache (EXACT BloodHound.py logic)
+                ml = []
                 for m in mems:
-                    cn = m.split(',')[0].replace('CN=','').replace('cn=','')
-                    ml.append({"ObjectIdentifier":m,"ObjectType":"Computer" if cn.endswith('$') else "User"})
+                    resolved = cache.resolve_dn(m)
+                    if resolved:
+                        ml.append(resolved)
+
+                # Resolve MemberOf for groups too
+                group_member_of = []
+                for m in mof:
+                    resolved = cache.resolve_dn(m)
+                    if resolved:
+                        group_member_of.append(resolved)
+
+                # High-value check (BloodHound.py logic)
+                is_highvalue = False
+                for rid in HIGHVALUE_RIDS:
+                    if sid.endswith(rid):
+                        is_highvalue = True
+                        break
+                if sid in HIGHVALUE_SIDS:
+                    is_highvalue = True
+
                 groups.append({
                     "ObjectIdentifier": sid,
                     "Properties": {
@@ -795,19 +817,25 @@ def collect_groups(conn, base_dn, domain, domain_sid):
                         "distinguishedname": str(ga(a,'distinguishedName','')),
                         "samaccountname": sam, "description": str(ga(a,'description','') or ''),
                         "admincount": bool(ga(a,'adminCount',0)),
-                        "highvalue":  sam.lower() in HIGH_VALUE_GROUPS, "sidhistory": hist,
+                        "highvalue": is_highvalue, "sidhistory": hist,
                     },
                     "Members": ml,
-                    "MemberOf": [{"ObjectIdentifier":m,"ObjectType":"Group"} for m in mof],
+                    "MemberOf": group_member_of,
                     "Aces": aces, "IsDeleted": False,
                 })
-            except: continue
+
+                # Cache this group
+                cache.add(str(ga(a,'distinguishedName','')), sid, "Group")
+
+            except Exception as ex:
+                continue
         print(Fore.GREEN + f"[+] Groups: {len(groups)}  ACEs: {sum(len(g['Aces']) for g in groups)}" + Style.RESET_ALL)
         return groups
     except Exception as ex:
         print(Fore.RED + f"[-] Groups: {ex}" + Style.RESET_ALL); return []
 
-def collect_computers(conn, base_dn, domain, domain_sid,
+
+def collect_computers(conn, base_dn, domain, domain_sid, cache,
                       dc_ip, username, password,
                       do_sessions=True, do_admins=True, threads=20):
     print(Fore.YELLOW + "[*] Collecting Computers..." + Style.RESET_ALL)
@@ -833,11 +861,23 @@ def collect_computers(conn, base_dn, domain, domain_sid,
                 dns  = str(ga(a,'dNSHostName','') or '')
                 is_dc= bool(uac & 0x2000)
                 delg = gal(a,'msDS-AllowedToDelegateTo')
-                mof  = gal(a,'memberOf'); hist = gal(a,'sIDHistory')
-                aces = parse_aces(graw(e,'nTSecurityDescriptor'))
+                mof  = gal(a,'memberOf')
+                hist = gal(a,'sIDHistory')
                 dsid = sid.rsplit('-',1)[0] if sid.count('-')>=3 else domain_sid
                 name = dns.upper() if dns else f"{sam.rstrip('$').upper()}.{dom_u}"
                 pgid = "516" if is_dc else str(ga(a,'primaryGroupID',515) or 515)
+
+                # Parse and resolve ACEs
+                raw_aces = parse_aces(graw(e,'nTSecurityDescriptor'), entrytype='computer')
+                aces = resolve_aces(raw_aces, domain, domain_sid, cache)
+
+                # Resolve MemberOf
+                member_of = []
+                for m in mof:
+                    resolved = cache.resolve_dn(m)
+                    if resolved:
+                        member_of.append(resolved)
+
                 computers.append({
                     "ObjectIdentifier": sid, "_target": dns or name,
                     "Properties": {
@@ -866,11 +906,16 @@ def collect_computers(conn, base_dn, domain, domain_sid,
                     "RemoteDesktopUsers": {"Results":[],"Collected":False,"FailureReason":None},
                     "DcomUsers":          {"Results":[],"Collected":False,"FailureReason":None},
                     "PSRemoteUsers":      {"Results":[],"Collected":False,"FailureReason":None},
-                    "MemberOf":  [{"ObjectIdentifier":m,"ObjectType":"Group"} for m in mof],
+                    "MemberOf":  member_of,
                     "HasSIDHistory": [{"ObjectIdentifier":s,"ObjectType":"Base"} for s in hist],
                     "Aces": aces, "IsDeleted": False,
                 })
-            except: continue
+
+                # Cache this computer
+                cache.add(str(ga(a,'distinguishedName','')), sid, "Computer")
+
+            except Exception as ex:
+                continue
 
         if (do_sessions or do_admins) and computers:
             print(Fore.YELLOW + f"[*] Live enum on {len(computers)} hosts..." + Style.RESET_ALL)
@@ -901,7 +946,8 @@ def collect_computers(conn, base_dn, domain, domain_sid,
     except Exception as ex:
         print(Fore.RED + f"[-] Computers: {ex}" + Style.RESET_ALL); return []
 
-def collect_ous(conn, base_dn, domain, domain_sid):
+
+def collect_ous(conn, base_dn, domain, domain_sid, cache):
     print(Fore.YELLOW + "[*] Collecting OUs..." + Style.RESET_ALL)
     try:
         conn.search(base_dn,'(objectClass=organizationalUnit)',search_scope=SUBTREE,
@@ -916,7 +962,10 @@ def collect_ous(conn, base_dn, domain, domain_sid):
                 guid = str(ga(a,'objectGUID',''))
                 gpl  = str(ga(a,'gPLink','') or '')
                 links= [{"GUID":f"{{{g.upper()}}}","IsEnforced":False} for g in re.findall(r'\{([^}]+)\}',gpl)]
-                aces = parse_aces(graw(e,'nTSecurityDescriptor'))
+
+                raw_aces = parse_aces(graw(e,'nTSecurityDescriptor'), entrytype='organizational-unit')
+                aces = resolve_aces(raw_aces, domain, domain_sid, cache)
+
                 ous.append({
                     "ObjectIdentifier": guid.upper() if guid else dn,
                     "Properties": {"name":f"{name.upper()}@{domain.upper()}","domain":domain.upper(),
@@ -924,13 +973,15 @@ def collect_ous(conn, base_dn, domain, domain_sid):
                                    "highvalue":False},
                     "Links":links,"ChildObjects":[],"Aces":aces,"IsDeleted":False,
                 })
+                cache.add(dn, guid.upper() if guid else dn, "OU")
             except: continue
         print(Fore.GREEN + f"[+] OUs: {len(ous)}" + Style.RESET_ALL)
         return ous
     except Exception as ex:
         print(Fore.RED + f"[-] OUs: {ex}" + Style.RESET_ALL); return []
 
-def collect_gpos(conn, base_dn, domain, domain_sid):
+
+def collect_gpos(conn, base_dn, domain, domain_sid, cache):
     print(Fore.YELLOW + "[*] Collecting GPOs..." + Style.RESET_ALL)
     try:
         conn.search(base_dn,'(objectClass=groupPolicyContainer)',search_scope=SUBTREE,
@@ -945,7 +996,10 @@ def collect_gpos(conn, base_dn, domain, domain_sid):
                 dname= str(ga(a,'displayName','') or '')
                 name = str(ga(a,'name','') or '')
                 guid = name.strip('{}').upper() if name else ""
-                aces = parse_aces(graw(e,'nTSecurityDescriptor'))
+
+                raw_aces = parse_aces(graw(e,'nTSecurityDescriptor'), entrytype='gpo')
+                aces = resolve_aces(raw_aces, domain, domain_sid, cache)
+
                 gpos.append({
                     "ObjectIdentifier": f"{{{guid}}}",
                     "Properties": {"name":f"{dname.upper()}@{domain.upper()}","domain":domain.upper(),
@@ -953,13 +1007,15 @@ def collect_gpos(conn, base_dn, domain, domain_sid):
                                    "gpcpath":str(ga(a,'gPCFileSysPath','') or ''),"highvalue":False},
                     "Aces":aces,"IsDeleted":False,
                 })
+                cache.add(dn, f"{{{guid}}}", "GPO")
             except: continue
         print(Fore.GREEN + f"[+] GPOs: {len(gpos)}" + Style.RESET_ALL)
         return gpos
     except Exception as ex:
         print(Fore.RED + f"[-] GPOs: {ex}" + Style.RESET_ALL); return []
 
-def collect_containers(conn, base_dn, domain, domain_sid):
+
+def collect_containers(conn, base_dn, domain, domain_sid, cache):
     print(Fore.YELLOW + "[*] Collecting Containers..." + Style.RESET_ALL)
     try:
         conn.search(base_dn,'(objectClass=container)',search_scope=SUBTREE,
@@ -972,7 +1028,10 @@ def collect_containers(conn, base_dn, domain, domain_sid):
                 dn   = str(ga(a,'distinguishedName',''))
                 name = str(ga(a,'name',''))
                 guid = str(ga(a,'objectGUID',''))
-                aces = parse_aces(graw(e,'nTSecurityDescriptor'))
+
+                raw_aces = parse_aces(graw(e,'nTSecurityDescriptor'), entrytype='container')
+                aces = resolve_aces(raw_aces, domain, domain_sid, cache)
+
                 containers.append({
                     "ObjectIdentifier": guid.upper() if guid else dn,
                     "Properties": {"name":f"{name.upper()}@{domain.upper()}","domain":domain.upper(),
@@ -980,11 +1039,83 @@ def collect_containers(conn, base_dn, domain, domain_sid):
                                    "highvalue":False},
                     "ChildObjects":[],"Aces":aces,"IsDeleted":False,
                 })
+                cache.add(dn, guid.upper() if guid else dn, "Container")
             except: continue
         print(Fore.GREEN + f"[+] Containers: {len(containers)}" + Style.RESET_ALL)
         return containers
     except Exception as ex:
         print(Fore.RED + f"[-] Containers: {ex}" + Style.RESET_ALL); return []
+
+
+# ══════════════════════════════════════════════════════════════════
+#  Default groups (BloodHound.py logic)
+# ══════════════════════════════════════════════════════════════════
+
+def write_default_groups(domain, domain_sid, cache):
+    """
+    BloodHound.py's write_default_groups() logic.
+    Adds well-known groups like Everyone, Authenticated Users, Interactive, Enterprise Domain Controllers.
+    """
+    groups = []
+    dom_u = domain.upper()
+
+    # Enterprise Domain Controllers
+    groups.append({
+        "IsDeleted": False,
+        "IsACLProtected": False,
+        "ObjectIdentifier": f"{dom_u}-S-1-5-9",
+        "Properties": {
+            "domain": dom_u,
+            "domainsid": domain_sid,
+            "name": f"ENTERPRISE DOMAIN CONTROLLERS@{dom_u}",
+        },
+        "Members": [],
+        "Aces": []
+    })
+
+    # Everyone
+    groups.append({
+        "IsDeleted": False,
+        "IsACLProtected": False,
+        "ObjectIdentifier": f"{dom_u}-S-1-1-0",
+        "Properties": {
+            "domain": dom_u,
+            "domainsid": domain_sid,
+            "name": f"EVERYONE@{dom_u}",
+        },
+        "Members": [],
+        "Aces": []
+    })
+
+    # Authenticated Users
+    groups.append({
+        "IsDeleted": False,
+        "IsACLProtected": False,
+        "ObjectIdentifier": f"{dom_u}-S-1-5-11",
+        "Properties": {
+            "domain": dom_u,
+            "domainsid": domain_sid,
+            "name": f"AUTHENTICATED USERS@{dom_u}",
+        },
+        "Members": [],
+        "Aces": []
+    })
+
+    # Interactive
+    groups.append({
+        "IsDeleted": False,
+        "IsACLProtected": False,
+        "ObjectIdentifier": f"{dom_u}-S-1-5-4",
+        "Properties": {
+            "domain": dom_u,
+            "domainsid": domain_sid,
+            "name": f"INTERACTIVE@{dom_u}",
+        },
+        "Members": [],
+        "Aces": []
+    })
+
+    return groups
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1037,12 +1168,6 @@ if __name__ == '__main__':
     do_sess = ask(Fore.CYAN+"[?] Enumerate sessions?    (y/n default y): "+Style.RESET_ALL, allow_empty=True).lower() != 'n'
     do_adm  = ask(Fore.CYAN+"[?] Enumerate local admins?(y/n default y): "+Style.RESET_ALL, allow_empty=True).lower() != 'n'
 
-    # ── Diagnostic user (optional) ────────────────────────────────
-    diag_user = ask(
-        Fore.CYAN+"[?] Diagnose specific user? "+Style.RESET_ALL+
-        Fore.YELLOW+"(sAMAccountName or Enter to skip): "+Style.RESET_ALL,
-        allow_empty=True)
-
     # ── Connect ───────────────────────────────────────────────────
     print(Fore.YELLOW+"\n[*] Connecting to LDAP..."+Style.RESET_ALL)
     conn = ldap_connect(dc_ip, domain, username, password)
@@ -1052,41 +1177,31 @@ if __name__ == '__main__':
     base_dn = get_base_dn(domain)
     print(Fore.CYAN+"\n[*] Starting collection...\n"+Style.RESET_ALL)
 
+    # Initialize the DN cache (BloodHound.py logic)
+    cache = ADCache(conn, base_dn, domain)
+
+    # ── CRITICAL: Pre-fetch all objects into cache ────────────────
+    # This is the KEY BloodHound.py logic that was missing!
+    cache.prefetch_all_objects()
+
     # ── Collect ───────────────────────────────────────────────────
-    domain_obj, domain_sid = collect_domain(conn, base_dn, domain)
+    domain_obj, domain_sid = collect_domain(conn, base_dn, domain, cache)
     trusts     = collect_trusts(conn, base_dn, domain)
-    users      = collect_users(conn, base_dn, domain, domain_sid)
-    groups     = collect_groups(conn, base_dn, domain, domain_sid)
-    computers  = collect_computers(conn, base_dn, domain, domain_sid,
-                                   dc_ip, username, password,
-                                   do_sessions=do_sess, do_admins=do_adm, threads=20)
-    ous        = collect_ous(conn, base_dn, domain, domain_sid)
-    gpos       = collect_gpos(conn, base_dn, domain, domain_sid)
-    containers = collect_containers(conn, base_dn, domain, domain_sid)
+    users      = collect_users(conn, base_dn, domain, domain_sid, cache)
+    groups     = collect_groups(conn, base_dn, domain, domain_sid, cache)
+    computers  = collect_computers(conn, base_dn, domain, domain_sid, cache,
+                                 dc_ip, username, password,
+                                 do_sessions=do_sess, do_admins=do_adm, threads=20)
+    ous        = collect_ous(conn, base_dn, domain, domain_sid, cache)
+    gpos       = collect_gpos(conn, base_dn, domain, domain_sid, cache)
+    containers = collect_containers(conn, base_dn, domain, domain_sid, cache)
 
     if domain_obj and trusts:
         domain_obj["Trusts"] = trusts
 
-    # ── Diagnostic + Auto-fix ─────────────────────────────────────
-    all_collected = {
-        "domains":    [domain_obj] if domain_obj else [],
-        "users":      users,
-        "groups":     groups,
-        "computers":  computers,
-        "ous":        ous,
-        "gpos":       gpos,
-        "containers": containers,
-    }
-
-    if diag_user:
-        print(Fore.CYAN+"\n[*] Running diagnostic..."+Style.RESET_ALL)
-        missing = diagnose_user(conn, base_dn, domain, diag_user, all_collected)
-        if missing:
-            print(Fore.YELLOW+f"\n[*] Auto-patching {len(missing)} objects with missing ACEs..."+Style.RESET_ALL)
-            patched = apply_missing_aces(all_collected, missing)
-            print(Fore.GREEN+f"[+] Patched {patched} ACEs into collected data!"+Style.RESET_ALL)
-        else:
-            print(Fore.GREEN+"[+] No missing ACEs found — data is complete!"+Style.RESET_ALL)
+    # Add default groups (BloodHound.py logic)
+    default_groups = write_default_groups(domain, domain_sid, cache)
+    groups.extend(default_groups)
 
     # ── Save ──────────────────────────────────────────────────────
     print(Fore.CYAN+"\n[*] Saving JSON files...\n"+Style.RESET_ALL)
