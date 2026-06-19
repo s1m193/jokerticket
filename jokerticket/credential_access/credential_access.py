@@ -643,10 +643,10 @@ def gather_inputs():
     print_c("\n  ┌─ Target Configuration ──────────────────────────────┐", "yellow")
 
     while True:
-        domain = input("\n  [+] Domain (e.g. cs.org): ").strip()
+        domain = input("\n  [+] Domain (e.g. domain.com): ").strip()
         if validate_domain(domain):
             break
-        print_c("  [!] Invalid domain. Example: cs.org", "red")
+        print_c("  [!] Invalid domain. Example: domain.com", "red")
 
     while True:
         username = input("  [+] Username: ").strip()
@@ -660,7 +660,7 @@ def gather_inputs():
         ip = input("  [+] DC IP address: ").strip()
         if validate_ip(ip):
             break
-        print_c("  [!] Invalid IP. Example: 192.168.1.41", "red")
+        print_c("  [!] Invalid IP. Example: 192.168.x.x", "red")
 
     print_c("  └────────────────────────────────────────────────────┘\n", "yellow")
     return domain, username, password, ip
