@@ -295,7 +295,7 @@ class JokerResetter:
         print(Fore.CYAN + "[*] " + "="*50)
         
         self.target_ip = self.get_input("Target DC IP", self.validate_ip)
-        self.domain = self.get_input("Domain (e.g., cs.org)")
+        self.domain = self.get_input("Domain (e.g., domain.com)")
         self.username = self.get_input("Username")
         self.old_password = self.get_input("Current Password", is_password=True)
         
