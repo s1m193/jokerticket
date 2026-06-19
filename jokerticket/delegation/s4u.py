@@ -57,8 +57,8 @@ signal.signal(signal.SIGINT, _exit_handler)
 def banner():
     print(Fore.CYAN + """
     ╔══════════════════════════════════════════════════════════════╗
-    ║      S4U2Self + S4U2Proxy Attack Tool                        ║
-    ║  Constrained Delegation & RBCD Abuse via Kerberos            ║
+    ║                S4U2Self + S4U2Proxy Attack                   ║
+    ║    Constrained Delegation & RBCD Abuse via Kerberos          ║
     ╚══════════════════════════════════════════════════════════════╝
     """ + Style.RESET_ALL)
 
