@@ -180,7 +180,7 @@ def ask_ip(prompt: str, default: str = "") -> str:
         except ValueError:
             pe(
                 f"'{raw}' is not a valid IP address "
-                f"(example: 192.168.10.20) — please try again."
+                f"(example: 192.168.1.1) — please try again."
             )
 
 
