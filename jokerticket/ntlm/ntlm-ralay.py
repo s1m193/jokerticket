@@ -884,10 +884,10 @@ class WebDAVTarget:
     def parse(cls, target_str: str) -> Optional['WebDAVTarget']:
         """
         Parse WebDAV target format:
-        - 192.168.1.100
-        - 192.168.1.100:8080
-        - 192.168.1.100@80/test
-        - https://192.168.1.100/test
+        - 192.168.x.x
+        - 192.168.x.x:8080
+        - 192.168.x.x@80/test
+        - https://192.168.x.x/test
         """
         target_str = target_str.strip()
 
