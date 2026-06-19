@@ -999,7 +999,7 @@ class RBCDAttack:
 
     def run(self):
         banner()
-        print(Fore.BLUE + "[*] Welcome to RBCD Attack Tool v2.0" + Style.RESET_ALL)
+
 
         # DC IP
         self.dc_ip = get_input(
