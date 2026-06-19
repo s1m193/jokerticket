@@ -230,7 +230,7 @@ def s4u2proxy(username, domain, dc_ip, target_spn, impersonate_user,
 
     RESULT:
       We hold a Kerberos service ticket for:
-        impersonate_user@LAB.LOCAL → cifs/WIN-RM9TRCNVS9P.lab.local
+        impersonate_user@domain.com → cifs/WIN-RM9TRCNVS9P.domain.com
       We can present this ticket directly to the target machine for SMB/WMI.
     """
     print(f"\n{B}{'─'*55}")
@@ -985,8 +985,8 @@ def interactive_wizard():
 
     # ── Network ───────────────────────────────────────────────────────────
     print(f"\n{C}{BO}  NETWORK{RS}")
-    args.domain = ask("  Domain", default="lab.local")
-    args.dc     = ask("  DC IP ", default="192.168.1.18")
+    args.domain = ask("  Domain", default="domain.com")
+    args.dc     = ask("  DC IP ", default="192.168.x.x")
 
     # ── Credentials ───────────────────────────────────────────────────────
     print(f"\n{C}{BO}  CREDENTIALS{RS}")
@@ -1005,7 +1005,7 @@ def interactive_wizard():
     if args.constrained or args.rbcd:
         print(f"\n{C}{BO}  ATTACK PARAMETERS{RS}")
         args.impersonate = ask("  User to impersonate", default="Administrator")
-        args.target_spn  = ask("  Target SPN (e.g. cifs/DC.lab.local)")
+        args.target_spn  = ask("  Target SPN (e.g. cifs/DC.domain.com)")
         if not args.target_spn:
             print(f"  {R}[!] Target SPN is required{RS}")
             sys.exit(1)
