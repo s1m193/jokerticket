@@ -1,11 +1,5 @@
 #!/usr/bin/env python3
-"""
-trust_abuse.py - Active Directory Trust Enumeration and Abuse Toolkit
-Level 8: Cross-Domain/Forest Trust Attacks
-Target: Windows Server AD 2022 (own environment only)
 
-Author: Seif
-"""
 
 import argparse
 import sys
@@ -130,7 +124,7 @@ def validate_lab_config(dc_ip, domain):
             print("  %s[+] Reachable ports: %s%s" % (G, ", ".join(open_ports), RS))
 
     if not domain or "." not in domain:
-        errors.append("Invalid domain format: '%s' (expected FQDN like cs.org)" % domain)
+        errors.append("Invalid domain format: '%s' (expected FQDN like domain.com)" % domain)
 
     if not resolve_domain(dc_ip, domain):
         warnings.append("Cannot resolve domain '%s'. DNS may be misconfigured or domain is wrong." % domain)
@@ -206,26 +200,25 @@ except ValueError:
 # INTERACTIVE CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
 def get_config():
-    print("\n%s%s╔══════════════════════════════════════════════════════════════╗" % (M, BO))
-    print("║     A D   T R U S T   A B U S E   T O O L K I T           ║")
-    print("║     Level 8 — Cross-Domain/Forest Trust Attacks             ║")
-    print("║     Enumerate | Decode | Simulate | Exploit              ║")
+    print("\n%s%s╔════════════════════════════════════════════════════════╗" % (M, BO))
+    print("║                 A D   T R U S T   A B U S E                  ║")
+    print("║           Enumerate | Decode | Simulate | Exploit            ║")
     print("╚══════════════════════════════════════════════════════════════╝%s" % RS)
 
     print("\n%s%s[ Lab Configuration ]%s" % (C, BO, RS))
     print("  %sPress Enter to use default value shown in [ ]%s\n" % (Y, RS))
 
-    dc_ip = safe_input("  %sDC IP      %s[192.168.1.48]%s: %s" % (W, C, W, RS))
+    dc_ip = safe_input("  %sDC IP      %s[192.168.x.x]%s: %s" % (W, C, W, RS))
     if dc_ip is None:
         return None, None
     if not dc_ip:
-        dc_ip = "192.168.1.48"
+        dc_ip = "192.168.x.x"
 
-    domain = safe_input("  %sDomain     %s[cs.org]%s:       %s" % (W, C, W, RS))
+    domain = safe_input("  %sDomain     %s[domain.com]%s:       %s" % (W, C, W, RS))
     if domain is None:
         return None, None
     if not domain:
-        domain = "cs.org"
+        domain = "domain.com"
 
     print("\n%s[*] Validating lab configuration...%s" % (B, RS))
     if not validate_lab_config(dc_ip, domain):
