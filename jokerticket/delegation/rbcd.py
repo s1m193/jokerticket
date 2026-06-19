@@ -637,7 +637,7 @@ class RBCDAttack:
     def interactive_setup(self):
         print(_banner())
         self.log.info("Welcome to RBCD Attack Framework v5.4 (Direct Libraries)")
-        self.domain   = self._ask("Domain FQDN  (e.g. corp.local)")
+        self.domain   = self._ask("Domain FQDN  (e.g. domain.com)")
         self.username = self._ask("Username")
         self.password = self._ask("Password", secret=True)
         self.dc_ip    = self._ask("DC IP Address")
