@@ -149,7 +149,7 @@ def _validate_ip(value):
     _validate_non_empty(value, "IP")
     pattern = r"^(\d{1,3}\.){3}\d{1,3}$"
     if not re.match(pattern, value):
-        raise ValueError("Invalid IP format. Expected: 192.168.1.10")
+        raise ValueError("Invalid IP format. Expected: 192.168.x.x")
     parts = value.split(".")
     for part in parts:
         try:
