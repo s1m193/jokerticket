@@ -856,14 +856,14 @@ def prompt(label: str, default: Optional[str] = None, secret: bool = False) -> s
 # ─── Main ─────────────────────────────────────────────────────────────────────
 def main():
     print("""
-╔══════════════════════════════════════════════════╗
-║         Golden Certificate Attack Tool          ║
-║                                                  ║
-║  Step 0: Discover CA via LDAP                   ║
-║  Step 1: Backup CA Private Key (SCM + SMB)      ║
-║  Step 2: Forge Certificate (offline)            ║
-║  Step 3: PKINIT Auth + NT Hash Extraction       ║
-╚══════════════════════════════════════════════════╝
+╔════════════════════════════════════════════════╗
+║         Golden Certificate Attack Tool         ║
+║                                                ║
+║  Step 0: Discover CA via LDAP                  ║
+║  Step 1: Backup CA Private Key (SCM + SMB)     ║
+║  Step 2: Forge Certificate (offline)           ║
+║  Step 3: PKINIT Auth + NT Hash Extraction      ║
+╚════════════════════════════════════════════════╝
 """)
 
     print("[*] Enter target details:\n")
