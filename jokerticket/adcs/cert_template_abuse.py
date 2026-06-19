@@ -1479,11 +1479,11 @@ class ESC4Attack:
     # ── Main flow ─────────────────────────────────────────────────────────────
     def run(self):
         # ─── Banner ──────────────────────────────────────────────────────────────
-        print(f"{Colors.BOLD}{Colors.OKCYAN}╔══════════════════════════════════════════════════════════════════════════════╗{Colors.ENDC}")
-        print(f"{Colors.BOLD}{Colors.OKCYAN}║  ESC4 CERTIFICATE TEMPLATE ABUSE                                             ║{Colors.ENDC}")
-        print(f"{Colors.BOLD}{Colors.OKCYAN}║  Active Directory Privilege Escalation via Certificate Templates             ║{Colors.ENDC}")
-        print(f"{Colors.BOLD}{Colors.OKCYAN}║                                                                              ║{Colors.ENDC}")
-        print(f"{Colors.BOLD}{Colors.OKCYAN}╚═════════════════════════════════════════════════════════════════════════════ ╝{Colors.ENDC}")
+        print(f"{Colors.BOLD}{Colors.OKCYAN}╔═════════════════════════════════════════════════════════════════════════════╗{Colors.ENDC}")
+        print(f"{Colors.BOLD}{Colors.OKCYAN}║                      ESC4 CERTIFICATE TEMPLATE ABUSE                        ║{Colors.ENDC}")
+        print(f"{Colors.BOLD}{Colors.OKCYAN}║        Active Directory Privilege Escalation via Certificate Templates      ║{Colors.ENDC}")
+        print(f"{Colors.BOLD}{Colors.OKCYAN}║                                                                             ║{Colors.ENDC}")
+        print(f"{Colors.BOLD}{Colors.OKCYAN}╚═════════════════════════════════════════════════════════════════════════════╝{Colors.ENDC}")
         # ──────────────────────────────────────────────────────────────────────────
         
 
