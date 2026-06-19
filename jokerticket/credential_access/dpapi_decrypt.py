@@ -250,7 +250,7 @@ FQDN_RE = re.compile(
 # Single-label NetBIOS-style name (letters, digits, hyphens, 1-15 chars)
 NETBIOS_RE = re.compile(r"^[A-Za-z0-9\-]{1,15}$")
 
-# Domain name — must contain a dot (e.g. cs.org, corp.internal, WORKGROUP.local)
+# Domain name — must contain a dot (e.g. domain.com, corp.internal, WORKGROUP.local)
 # OR be a plain NetBIOS workgroup name (letters/digits/hyphens, 1-15 chars)
 DOMAIN_RE = re.compile(
     r"^(?:[A-Za-z0-9\-]{1,15}|"                         # NetBIOS workgroup
@@ -283,7 +283,7 @@ def is_valid_ipv4(v):
 def is_valid_target_host(v):
     """
     Accept any of:
-      - Valid IPv4  (192.168.10.30)
+      - Valid IPv4  (192.168.x.x)
       - FQDN        (dc01.corp.local)
       - NetBIOS     (WIN-DC01, MVC)   — short machine names used on internal nets
     """
@@ -557,7 +557,7 @@ def _val_target(v):
             False,
             "'%s' is not a valid target.\n"
             "Accepted formats:\n"
-            "  IPv4 address : 192.168.10.30\n"
+            "  IPv4 address : 192.168.x.x\n"
             "  FQDN         : dc01.corp.local\n"
             "  NetBIOS name : WIN-DC01  (letters, digits, hyphens only, max 15 chars)" % v
         )
@@ -613,7 +613,7 @@ def _val_domain(v):
                 False,
                 "'%s' is not a valid domain name.\n"
                 "Accepted formats:\n"
-                "  FQDN workgroup  : cs.org   corp.internal   ad.company.com\n"
+                "  FQDN workgroup  : domain.com   corp.internal   ad.company.com\n"
                 "  NetBIOS name    : WORKGROUP   CS   CORP   (max 15 chars)\n"
                 "Leave blank for a local account." % v
             )
@@ -637,7 +637,7 @@ def _val_dc_ip(v):
         return (
             False,
             "'%s' is not a valid IPv4 address.\n"
-            "DC IP must be a dotted-decimal address, e.g. 192.168.10.1\n"
+            "DC IP must be a dotted-decimal address, e.g. 192.168.x.x\n"
             "Leave blank if you do not need Kerberos / DC lookup." % v
         )
     except Exception as exc:
