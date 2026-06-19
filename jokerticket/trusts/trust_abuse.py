@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
     ╔═══════════════════════════════════════════════════════════╗
-    ║           Cross Domain / Forest Trust Abuse             ║
-    ║  Enumerate | Decode | Exploit Cross-Forest & Intra-     ║
-    ║  Forest Trusts via LDAP, RPC/SAMR, and Kerberos         ║
+    ║           Cross Domain / Forest Trust Abuse               ║
+    ║  Enumerate | Decode | Exploit Cross-Forest & Intra-       ║
+    ║  Forest Trusts via LDAP, RPC/SAMR, and Kerberos           ║
     ╚═══════════════════════════════════════════════════════════╝
 """
 
