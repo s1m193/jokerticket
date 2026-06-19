@@ -1,17 +1,6 @@
   #!/usr/bin/env python3
 
-"""
-╔════════════════════════════════════════════════════════════════╗
-║          RBCD Attack Framework - Interactive Edition           ║
-║     Resource-Based Constrained Delegation Attack Tool          ║
-╚════════════════════════════════════════════════════════════════╝
 
-Requirements:
-    pip install impacket ldap3 colorama pyasn1 six
-
-Usage:
-    python3 rbcd_attack.py
-"""
 
 import sys
 import os
@@ -110,13 +99,13 @@ def _banner() -> str:
     return (
         f"{Fore.CYAN}\n"
         "╔══════════════════════════════════════════════════════════════╗\n"
-        f"║  {Fore.RED}██████╗ ██████╗  ██████╗██████╗     █████╗ ████████╗████████╗{Fore.CYAN} ║\n"
-        f"║  {Fore.RED}██╔══██╗██╔══██╗██╔════╝██╔══██╗   ██╔══██╗╚══██╔══╝╚══██╔══╝{Fore.CYAN} ║\n"
+        f"║  {Fore.RED}██████╗ ██████╗  ██████╗██████╗     █████╗ ████████╗████████╗{Fore.CYAN}  ║\n"
+        f"║  {Fore.RED}██╔══██╗██╔══██╗██╔════╝██╔══██╗   ██╔══██╗╚══██╔══╝╚══██╔══╝{Fore.CYAN}  ║\n"
         f"║  {Fore.RED}██████╔╝██████╔╝██║     ██║  ██║   ███████║   ██║      ██║   {Fore.CYAN}  ║\n"
         f"║  {Fore.RED}██╔══██╗██╔══██╗██║     ██║  ██║   ██╔══██║   ██║      ██║   {Fore.CYAN}  ║\n"
         f"║  {Fore.RED}██║  ██║██████╔╝╚██████╗██████╔╝   ██║  ██║   ██║      ██║   {Fore.CYAN}  ║\n"
-        f"║  {Fore.RED}╚═╝  ╚═╝╚═════╝  ╚═════╝╚═════╝    ╚═╝  ╚═╝   ╚═╝      ╚═╝  {Fore.CYAN}  ║\n"
-        f"║           {Fore.YELLOW}RBCD Attack Framework v5.4 — Interactive{Fore.CYAN}           ║\n"
+        f"║  {Fore.RED}╚═╝  ╚═╝╚═════╝  ╚═════╝╚═════╝    ╚═╝  ╚═╝   ╚═╝      ╚═╝  {Fore.CYAN}   ║\n"
+        f"║                                                                                      ║\n"
         f"╚══════════════════════════════════════════════════════════════╝{Style.RESET_ALL}"
     )
 
