@@ -121,10 +121,10 @@ def gather_inputs() -> Tuple[str, str, str, str, str, str]:
 
     # Domain
     while True:
-        domain = input(f"  {Colors.CYAN}Domain (e.g. lab.local)        → {Colors.RESET}").strip()
+        domain = input(f"  {Colors.CYAN}Domain (e.g. Domain.Com)        → {Colors.RESET}").strip()
         if domain and "." in domain:
             break
-        cprint("  [!] Enter a valid domain like lab.local", "RED")
+        cprint("  [!] Enter a valid domain like Domain.Com", "RED")
 
     # Username
     while True:
@@ -149,7 +149,6 @@ def gather_inputs() -> Tuple[str, str, str, str, str, str]:
         cprint("  [!] Invalid hash. Must be 32 hex chars.", "RED")
 
     # FIX: Ask user to confirm/enter FQDN instead of auto-resolving
-    # Auto-resolve can fail in lab environments without proper reverse DNS
     resolved = resolve_fqdn(dc_ip, domain)
     cprint(f"\n  [*] Auto-resolved hostname: {resolved}", "CYAN")
     manual = input(
