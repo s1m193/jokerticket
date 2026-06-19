@@ -2631,8 +2631,8 @@ class ESC7Attack:
 
 def collect_interactive(args) -> argparse.Namespace:
     print(f"{C.BD}{C.B}╔══════════════════════════════════════════════════════════════════════════════╗{C.X}")
-    print(f"{C.BD}{C.B}║  ESC7 ADCS ATTACK CHAIN                                                      ║{C.X}")
-    print(f"{C.BD}{C.B}║  Active Directory Certificate Services — ESC7 Exploitation                   ║{C.X}")
+    print(f"{C.BD}{C.B}║                         ESC7 ADCS ATTACK CHAIN                               ║{C.X}")
+    print(f"{C.BD}{C.B}║          Active Directory Certificate Services — ESC7 Exploitation           ║{C.X}")
     print(f"{C.BD}{C.B}║                                                                              ║{C.X}")
     print(f"{C.BD}{C.B}╚══════════════════════════════════════════════════════════════════════════════╝{C.X}")
 
@@ -2909,8 +2909,8 @@ def main() -> None:
     )
 
     print(f"{C.BD}{C.B}╔══════════════════════════════════════════════════════════════════════════════╗{C.X}")
-    print(f"{C.BD}{C.B}║  ESC7 ADCS ATTACK CHAIN                                                      ║{C.X}")
-    print(f"{C.BD}{C.B}║  Active Directory Certificate Services — ESC7 Exploitation                   ║{C.X}")
+    print(f"{C.BD}{C.B}║                         ESC7 ADCS ATTACK CHAIN                               ║{C.X}")
+    print(f"{C.BD}{C.B}║         Active Directory Certificate Services — ESC7 Exploitation            ║{C.X}")
     print(f"{C.BD}{C.B}║                                                                              ║{C.X}")
     print(f"{C.BD}{C.B}╚══════════════════════════════════════════════════════════════════════════════╝{C.X}")
 
