@@ -398,7 +398,7 @@ def build_ntlmssp_challenge(challenge: bytes, domain: str) -> bytes:
     Build an NTLMSSP Type 2 (Challenge) message.
 
     Domain name handling:
-      FQDN  ("cs.org") → NetBIOS="CS",    DNS domain="cs.org"
+      FQDN  ("domain.com") → NetBIOS="CS",    DNS domain="domain.com"
       Flat  ("CS")     → NetBIOS="CS",    DNS domain="cs.local"
     The DC validates AvPair names against its own identity; incorrect
     values cause it to disconnect before sending the Type 3 response.
@@ -1617,7 +1617,7 @@ def _detect_local_ip() -> str:
     try:
         import re
         r = subprocess.run(
-            ["ip", "route", "get", "192.168.10.0"],
+            ["ip", "route", "get", "192.168.x.x"],
             capture_output=True, text=True, timeout=3,
         )
         m = re.search(r"src (\d+\.\d+\.\d+\.\d+)", r.stdout)
