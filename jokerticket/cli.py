@@ -91,7 +91,7 @@ def menu():
             "1": ("AS-REP Roasting → Passwords without preauth", "kerberos/AS-REPRoasting.py"),
             "2": ("Kerberoasting → SPN Hash Party!", "kerberos/Kerberoasting.py"),
             "3": ("Golden Ticket Attack", "kerberos/Golden-Ticket.py"),
-            "4": ("SPN Scan", "kerberos/SPN.py"),
+            "4": ("SPN Abuse", "kerberos/SPN.py"),
             "5": ("Shadow Credentials Attack", "kerberos/Shadow-credentials.py"),
             "6": ("Intercept Kerberos Tickets", "kerberos/intercept_kerberos_tickets.py"),
             "7": ("Force Change Password", "kerberos/ForceChangePassword.py"),
