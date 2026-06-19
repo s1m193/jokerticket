@@ -85,9 +85,8 @@ signal.signal(signal.SIGINT, signal_handler)
 def banner():
     print(Fore.MAGENTA + """
     ╔═══════════════════════════════════════════════════════════╗
-    ║              G P O   A B U S E                            ║
-    ║         Scheduled Task Injection via GPO                ║
-    ║  [+] Pass-the-Hash & Pass-the-Ticket Support            ║
+    ║                 G P O   A B U S E                         ║
+    ║         Scheduled Task Injection via GPO                  ║
     ╚═══════════════════════════════════════════════════════════╝
     """ + Style.RESET_ALL)
 
