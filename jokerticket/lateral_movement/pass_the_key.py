@@ -439,7 +439,7 @@ def collect_credentials():
     print(f"{C.BD}{C.B}{pad("TARGET INFORMATION")}{C.X}")
     print(f"{C.BD}{C.B}╚{"═" * inner}╝{C.X}")
     domain = get_input(
-        " Domain (e.g., CORP.LOCAL, cs.org)",
+        " Domain (e.g., CORP.LOCAL, domain.com)",
         required=True, validator=validate_domain
     )
     username = get_input(
@@ -448,7 +448,7 @@ def collect_credentials():
     )
     dc_ip = get_input(
         " Domain Controller IP",
-        default="192.168.10.10",
+        default="192.168.x.x",
         required=True, validator=validate_ip
     )
 
@@ -1066,7 +1066,7 @@ def main():
             ccache_file = get_input(" Path to .ccache file", default="Administrator.ccache", required=True, validator=validate_file_exists)
             username = get_input(" Username", required=True, validator=validate_username)
             domain = get_input(" Domain", required=True, validator=validate_domain)
-            dc_ip = get_input(" DC IP", default="192.168.10.10", required=True, validator=validate_ip)
+            dc_ip = get_input(" DC IP", default="192.168.x.x", required=True, validator=validate_ip)
             target = get_input(" Target IP/Hostname", required=True, validator=validate_target)
             sign_in_with_ticket(target, username, domain, dc_ip, ccache_file)
             continue
