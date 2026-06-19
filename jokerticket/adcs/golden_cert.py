@@ -870,18 +870,18 @@ def main():
 
     # ── DC IP with validation ──
     while True:
-        dc_ip = prompt("DC IP", "192.168.10.10")
+        dc_ip = prompt("DC IP", "192.168.x.x")
         if not dc_ip:
-            dc_ip = "192.168.10.10"
+            dc_ip = "192.168.x.x"
         if _validate_ip(dc_ip):
             break
         warn(f"'{dc_ip}' does not look like a valid IPv4/IPv6 address. Please retry.")
 
     # ── Domain with validation ──
     while True:
-        domain = prompt("Domain", "cs.org")
+        domain = prompt("Domain", "domain.com")
         if not domain:
-            domain = "cs.org"
+            domain = "domain.com"
         if _validate_domain(domain):
             break
         warn(f"'{domain}' does not look like a valid domain. Please retry.")
