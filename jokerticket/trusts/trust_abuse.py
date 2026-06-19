@@ -316,9 +316,6 @@ except ImportError:
     IMPACKET_AVAILABLE = False
 
 
-# #############################################################################
-# TRUST ABUSE ENGINE -- Core Class
-# #############################################################################
 class TrustAbuseEngine:
     """
     Cross Domain / Forest Trust Abuse Engine
@@ -1241,9 +1238,7 @@ class TrustAbuseEngine:
             print(Fore.YELLOW + "\n[!] All techniques are for authorized testing only." + Style.RESET_ALL)
 
 
-# #############################################################################
-# MAIN MENU & INTERACTIVE FLOW
-# #############################################################################
+
 def show_menu():
     print(Fore.CYAN + "\n═══════════════════════════════════════════════════════════════" + Style.RESET_ALL)
     print(Fore.CYAN + "           SELECT TRUST ABUSE TECHNIQUE" + Style.RESET_ALL)
