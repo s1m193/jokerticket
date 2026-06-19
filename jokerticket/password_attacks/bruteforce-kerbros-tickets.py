@@ -34,7 +34,7 @@ def banner():
     print(Fore.CYAN + """
     ╔═══════════════════════════════════════════════════════════╗
     ║            Kerberos Brute-Forcer / Password Spray         ║
-    ║          Exploit weak passwords via Kerberos Pre-Auth      ║
+    ║          Exploit weak passwords via Kerberos Pre-Auth     ║
     ╚═══════════════════════════════════════════════════════════╝
     """ + Style.RESET_ALL)
     print(Fore.YELLOW + f"[*] Running on: {sys.platform}" + Style.RESET_ALL)
