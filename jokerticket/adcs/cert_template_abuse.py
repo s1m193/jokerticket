@@ -137,11 +137,11 @@ class Validator:
             except ValueError:
                 raise InputValidationError(
                     f"'{ip}' is not a valid IPv4 address. "
-                    f"Example: 192.168.10.30"
+                    f"Example: 192.168.x.x"
                 )
         raise InputValidationError(
             f"'{ip}' is not a valid IPv4 address. "
-            f"Example: 192.168.10.30"
+            f"Example: 192.168.x.x"
         )
 
     @staticmethod
@@ -155,7 +155,7 @@ class Validator:
         if not re.match(pattern, hostname):
             raise InputValidationError(
                 f"'{hostname}' is not a valid hostname. "
-                f"Example: WIN-DC01.corp.local"
+                f"Example: WIN-DC01.domain.com"
             )
         return hostname
 
@@ -200,7 +200,7 @@ class Validator:
         if "." not in domain and len(domain) > 15:
             raise InputValidationError(
                 f"Domain '{domain}' doesn't look valid.\n"
-                f"  FQDN example: CORP.LOCAL\n"
+                f"  FQDN example: domain.com\n"
                 f"  NetBIOS example: CORP"
             )
         return username, domain
