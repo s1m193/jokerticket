@@ -2690,14 +2690,14 @@ def collect_interactive(args) -> argparse.Namespace:
 
         if not args.domain:
             args.domain = _prompt(
-                "Domain (e.g. cs.org)",
+                "Domain (e.g. domain.com)",
                 validator=_is_valid_domain,
                 error_msg="Domain must contain a dot and no @ sign.",
             )
 
         if not args.upn:
             args.upn = _prompt(
-                "Target UPN (e.g. Administrator@cs.org)",
+                "Target UPN (e.g. Administrator@domain.com)",
                 validator=_is_valid_upn,
                 error_msg="UPN must be in user@domain.tld format.",
             )
@@ -2706,7 +2706,7 @@ def collect_interactive(args) -> argparse.Namespace:
         if args.target_host and "@" in args.target_host:
             _warn(
                 "--target-host looks like a UPN (" + repr(args.target_host) + "). "
-                "It must be the CA server FQDN (e.g. WIN-XYZ.cs.org)."
+                "It must be the CA server FQDN (e.g. WIN-XYZ.domain.com)."
             )
             args.target_host = None
 
@@ -2778,8 +2778,8 @@ def parse_args() -> argparse.Namespace:
         epilog="""
 Examples:
   python3 esc7_unified.py
-  python3 esc7_unified.py -u ca-admin@cs.org -p Password1 \\
-      --dc-ip 192.168.10.30 --upn Administrator@cs.org
+  python3 esc7_unified.py -u ca-admin@domain.com -p Password1 \\
+      --dc-ip 192.168.10.30 --upn Administrator@domain.com
   python3 esc7_unified.py ... --start-from 5 --request-id 37
         """,
     )
