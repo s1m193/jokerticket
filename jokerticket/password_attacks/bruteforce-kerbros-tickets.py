@@ -203,7 +203,7 @@ def main():
 
     dc_ip = get_input(
         Fore.CYAN + "[?] Enter Domain Controller IP: " + Style.RESET_ALL,
-        validate_ip, "Invalid IP address! Example: 192.168.1.1"
+        validate_ip, "Invalid IP address! Example: 192.168.x.x"
     )
     print(Fore.YELLOW + "[*] Checking DC reachability (port 88)..." + Style.RESET_ALL)
     if not check_host_reachable(dc_ip, 88):
@@ -214,7 +214,7 @@ def main():
     print(Fore.GREEN + f"[+] DC {dc_ip} is reachable!" + Style.RESET_ALL)
 
     domain = get_input(
-        Fore.CYAN + "[?] Enter Domain Name (e.g., cs.org): " + Style.RESET_ALL,
+        Fore.CYAN + "[?] Enter Domain Name (e.g., domain.com): " + Style.RESET_ALL,
         validate_domain, "Invalid domain format!"
     )
 
