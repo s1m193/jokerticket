@@ -41,7 +41,6 @@ BANNER = f"""
 {M}{BO}╔═════════════════════════════════════════════╗
 ║   K E R B E R O S   T I C K E T   H A R V E S T    ║
 ║   Dump | Parse | Convert | Pass-the-Ticket         ║
-║        domain.com  |  192.168.x.x                  ║
 ╚════════════════════════════════════════════════════╝{RS}
 """
 
