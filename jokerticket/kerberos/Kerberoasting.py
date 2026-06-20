@@ -476,7 +476,7 @@ if __name__ == '__main__':
     print(Fore.GREEN + f"[+] DC {dc_ip} is reachable!" + Style.RESET_ALL)
 
     domain   = get_input(Fore.CYAN + "[?] Enter Domain Name    : " + Style.RESET_ALL,
-                         validate_domain, "Invalid domain! Example: cs.org")
+                         validate_domain, "Invalid domain! Example: Domain.com")
     username = get_input(Fore.CYAN + "[?] Enter Username       : " + Style.RESET_ALL)
     password = get_input(Fore.CYAN + "[?] Enter Password       : " + Style.RESET_ALL)
 
