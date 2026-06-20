@@ -113,7 +113,7 @@ categories = {
               ["Kerberoasting", "kerberoast", "SPN hash"]),
         "3": ("Golden Ticket Attack", "kerberos/Golden-Ticket.py",
               ["Golden-Ticket", "golden ticket", "krbtgt", "forge TGT", "SpoofSIDHistory"]),
-        "4": ("SPN Scan / Targeted Kerberoasting", "kerberos/SPN.py",
+        "4": ("Kerberoast Abuse / Targeted Kerberoasting", "kerberos/SPN.py",
               ["SPN", "spn scan", "servicePrincipalName", "targeted kerberoasting",
                "GenericWrite", "WriteSPN"]),
         "5": ("Shadow Credentials Attack", "kerberos/Shadow-credentials.py",
