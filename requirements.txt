@@ -12,3 +12,9 @@ pycryptodome
 certipy-ad
 pypsrp
 gssapi
+requests
+requests-ntlm
+pymssql
+pytds
+six
+urllib3
