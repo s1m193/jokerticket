@@ -15,6 +15,6 @@ gssapi
 requests
 requests-ntlm
 pymssql
-pytds
 six
 urllib3
+pytds
