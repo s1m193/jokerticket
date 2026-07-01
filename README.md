@@ -7,9 +7,8 @@
 
 ## 📌 Overview
 
-**JokerTicket** is a modular Active Directory penetration testing framework designed for security assessment, red teaming simulations, and educational purposes.
-
-It provides a unified interface to execute various AD attack techniques
+**JokerTicket** is a powerful, modular Active Directory penetration testing framework built for real-world security assessments, advanced red team operations, and comprehensive network auditing.
+Designed to streamline operations in complex enterprise environments, JokerTicket provides security professionals with a unified, scalable interface to efficiently identify, exploit, and document AD vulnerabilities through cutting-edge attack techniques.
 
 _____________________________________________________________________________________________________________________________
 ## 🚀 Installation
